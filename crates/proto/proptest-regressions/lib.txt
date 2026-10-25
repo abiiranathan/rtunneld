@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 6fff1a2d49aac41a1e23fecbe6d59fad46e8d3ec6ff3730318fced9ee7ce0009 # shrinks to message = Hello { protocol_minor: 0, features: [] }

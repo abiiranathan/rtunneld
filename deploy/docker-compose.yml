@@ -1,0 +1,14 @@
+version: "3.9"
+services:
+  rtunneld:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    command: ["/usr/local/bin/rtunneld", "serve"]
+    ports:
+      - "4433:4433/udp"
+    volumes:
+      - rtunnel-state:/var/lib/rtunnel
+
+volumes:
+  rtunnel-state:

@@ -1,0 +1,18 @@
+[package]
+name = "rtunnel-transport"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "rtunnel_transport"
+
+[dependencies]
+bytes = { workspace = true }
+quinn = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "io-util", "net", "macros"] }
