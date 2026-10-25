@@ -1,245 +1,307 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::all, clippy::pedantic)]
+#![allow(clippy::module_name_repetitions)]
+
+pub mod spki;
+pub mod verifier;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
-use chrono::Utc;
-use rcgen::{CertifiedKey, generate_simple_self_signed};
-use serde::{Deserialize, Serialize};
+use rcgen::{CertificateParams, KeyPair, PKCS_ED25519};
 use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use thiserror::Error;
 
-/// A generated or loaded key pair for one peer.
+pub use spki::extract_spki;
+pub use verifier::{PeerValidator, PinnedClientVerifier, PinnedServerVerifier};
+
+/// Errors encountered in identity generation, verification, or serialization.
+#[derive(Debug, Error)]
+pub enum IdentityError {
+    /// Certificate generation error.
+    #[error("certificate generation error: {0}")]
+    Cert(#[from] rcgen::Error),
+    /// Invalid private key or certificate format.
+    #[error("invalid key material: {0}")]
+    InvalidKey(String),
+    /// Insecure file permissions detected on private key file.
+    #[error("insecure file mode on private key: {0:o}")]
+    UnsafeKeyMode(u32),
+    /// File system input or output failure.
+    #[error("file system error: {0}")]
+    Io(String),
+    /// Hex decoding error.
+    #[error("hex decode error")]
+    HexDecode,
+}
+
+/// PEM and DER representation of an ed25519 identity keypair and self-signed certificate.
 #[derive(Clone, Debug)]
 pub struct KeyMaterial {
-    /// PEM-encoded private key material.
+    /// PKCS#8 private key in PEM format.
     pub private_key_pem: String,
-    /// PEM-encoded public certificate for TLS.
+    /// Self-signed X.509 certificate in PEM format.
     pub certificate_pem: String,
-    /// Hex fingerprint of the certificate's public key.
+    /// DER bytes of the self-signed certificate.
+    pub certificate_der: Vec<u8>,
+    /// Hex-encoded SHA-256 fingerprint of the `SubjectPublicKeyInfo`.
     pub fingerprint: String,
 }
 
-/// Error type for identity generation and loading.
-#[derive(Debug, Error)]
-pub enum IdentityError {
-    #[error("could not create certificate: {0}")]
-    Cert(#[from] rcgen::Error),
-    #[error("key material is invalid: {0}")]
-    InvalidKey(String),
-    #[error("private key file is not safe: mode {0}")]
-    UnsafeKeyMode(u32),
-    #[error("I/O error: {0}")]
-    Io(String),
-    #[error("certificate fingerprint does not match expected pin")]
-    FingerprintMismatch,
-}
-
-/// Generate a self-signed certificate bound to a fresh key pair.
+/// Generates a fresh ed25519 keypair and self-signed X.509 certificate.
 ///
 /// # Errors
 ///
-/// Returns an error when the certificate cannot be generated or serialized.
+/// Returns an [`IdentityError`] if key or certificate construction fails.
 pub fn generate_identity(name: &str) -> Result<KeyMaterial, IdentityError> {
-    let CertifiedKey { cert, key_pair } =
-        generate_simple_self_signed([name.to_string()]).map_err(IdentityError::Cert)?;
-    let private_key_pem = key_pair.serialize_pem();
+    let key_pair = KeyPair::generate_for(&PKCS_ED25519)?;
+    let mut params = CertificateParams::new(vec![name.to_string()])?;
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, name);
+    let cert = params.self_signed(&key_pair)?;
+    let certificate_der = cert.der().to_vec();
     let certificate_pem = cert.pem();
-    let fingerprint = fingerprint_from_der(cert.der());
+    let private_key_pem = key_pair.serialize_pem();
+    let spki_der = extract_spki(&certificate_der)?;
+    let fingerprint = fingerprint_from_spki(spki_der);
     Ok(KeyMaterial {
         private_key_pem,
         certificate_pem,
+        certificate_der,
         fingerprint,
     })
 }
 
-/// Load and validate a PKCS#8 private key file.
-///
-/// # Errors
-///
-/// Returns an error if the file cannot be read, is insecurely permissioned, or is empty.
-pub fn load_private_key(path: &Path) -> Result<String, IdentityError> {
-    let metadata = fs::metadata(path).map_err(|err| IdentityError::Io(err.to_string()))?;
-    #[cfg(unix)]
-    {
-        let mode = metadata.permissions().mode() & 0o777;
-        if mode & 0o077 != 0 {
-            return Err(IdentityError::UnsafeKeyMode(mode));
-        }
-    }
-    let bytes = fs::read(path).map_err(|err| IdentityError::Io(err.to_string()))?;
-    let text = String::from_utf8(bytes).map_err(|err| IdentityError::Io(err.to_string()))?;
-    if text.trim().is_empty() {
-        return Err(IdentityError::InvalidKey("empty private key".to_string()));
-    }
-    Ok(text)
-}
-
-/// Derive a stable SHA-256 fingerprint from a certificate's DER data.
+/// Computes the hex-encoded SHA-256 fingerprint of `SubjectPublicKeyInfo` bytes.
 #[must_use]
-pub fn fingerprint_from_der(der: &[u8]) -> String {
-    let digest = Sha256::digest(der);
-    format!("{digest:x}")
+pub fn fingerprint_from_spki(spki_der: &[u8]) -> String {
+    let digest = Sha256::digest(spki_der);
+    hex_encode(&digest)
 }
 
-/// Derive a stable SHA-256 fingerprint from a certificate PEM string.
-#[must_use]
-pub fn fingerprint_from_pem(pem: &str) -> String {
-    let digest = Sha256::digest(pem.as_bytes());
-    format!("{digest:x}")
-}
-
-/// Encode bytes to a hex string.
+/// Encodes binary data into lowercase hexadecimal.
 #[must_use]
 pub fn hex_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
-        use std::fmt::Write as _;
-        write!(&mut out, "{byte:02x}").expect("writing to a String cannot fail");
+        write!(&mut out, "{byte:02x}").expect("writing to a string cannot fail");
     }
     out
 }
 
-/// Encode bytes to a base64 string.
+/// Decodes binary data from hexadecimal.
+///
+/// # Errors
+///
+/// Returns [`IdentityError::HexDecode`] if the input length is odd or contains invalid hex characters.
+pub fn hex_decode(s: &str) -> Result<Vec<u8>, IdentityError> {
+    if !s.len().is_multiple_of(2) {
+        return Err(IdentityError::HexDecode);
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| IdentityError::HexDecode))
+        .collect()
+}
+
+/// Performs a constant-time equality comparison between two byte slices.
 #[must_use]
-pub fn base64_encode(bytes: &[u8]) -> String {
-    STANDARD.encode(bytes)
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
-/// Build a URL-safe enrollment token payload.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct EnrollmentToken {
-    /// The relay fingerprint to pin.
-    pub relay_fingerprint: String,
-    /// The role requested: agent or client.
-    pub role: String,
-    /// The target name for the peer.
-    pub name: String,
-    /// Expiration time in RFC3339 format.
-    pub expires_at: String,
-    /// Random nonce used for one-time validity.
-    pub nonce: String,
+/// Validates that a peer name contains only lower-case alphanumerics and hyphens.
+#[must_use]
+pub fn is_valid_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 63 {
+        return false;
+    }
+    name.chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
-/// Parsed enrollment URI that pins a relay fingerprint and binds a one-time token.
+/// Decodes a base64 PEM block into raw DER bytes.
+///
+/// # Errors
+///
+/// Returns [`IdentityError::InvalidKey`] if the PEM cannot be parsed or base64 decoded.
+pub fn pem_to_der(pem: &str) -> Result<Vec<u8>, IdentityError> {
+    let base64_str: String = pem
+        .lines()
+        .filter(|line| !line.starts_with("-----"))
+        .collect();
+    STANDARD
+        .decode(base64_str)
+        .map_err(|e| IdentityError::InvalidKey(e.to_string()))
+}
+
+/// Loads a keypair and certificate from disk, validating file permissions on Unix.
+///
+/// # Errors
+///
+/// Returns [`IdentityError::UnsafeKeyMode`] if the private key file has group or world permissions,
+/// or [`IdentityError::Io`] if reading fails.
+pub fn load_identity(state_dir: &Path) -> Result<KeyMaterial, IdentityError> {
+    let key_path = state_dir.join("identity.key");
+    let cert_path = state_dir.join("identity.crt");
+
+    let meta = fs::metadata(&key_path).map_err(|e| IdentityError::Io(e.to_string()))?;
+    #[cfg(unix)]
+    {
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(IdentityError::UnsafeKeyMode(mode));
+        }
+    }
+
+    let private_key_pem =
+        fs::read_to_string(&key_path).map_err(|e| IdentityError::Io(e.to_string()))?;
+    let certificate_pem =
+        fs::read_to_string(&cert_path).map_err(|e| IdentityError::Io(e.to_string()))?;
+    let certificate_der = pem_to_der(&certificate_pem)?;
+    let spki_der = extract_spki(&certificate_der)?;
+    let fingerprint = fingerprint_from_spki(spki_der);
+
+    Ok(KeyMaterial {
+        private_key_pem,
+        certificate_pem,
+        certificate_der,
+        fingerprint,
+    })
+}
+
+/// Saves an identity keypair and certificate to disk with strict file permissions (0600 on Unix).
+///
+/// # Errors
+///
+/// Returns [`IdentityError::Io`] if file creation or permission assignment fails.
+pub fn save_identity(state_dir: &Path, identity: &KeyMaterial) -> Result<(), IdentityError> {
+    fs::create_dir_all(state_dir).map_err(|e| IdentityError::Io(e.to_string()))?;
+    let key_path = state_dir.join("identity.key");
+    let cert_path = state_dir.join("identity.crt");
+
+    fs::write(&key_path, &identity.private_key_pem)
+        .map_err(|e| IdentityError::Io(e.to_string()))?;
+    #[cfg(unix)]
+    {
+        let mut perms = fs::metadata(&key_path)
+            .map_err(|e| IdentityError::Io(e.to_string()))?
+            .permissions();
+        perms.set_mode(0o600);
+        fs::set_permissions(&key_path, perms).map_err(|e| IdentityError::Io(e.to_string()))?;
+    }
+
+    fs::write(&cert_path, &identity.certificate_pem)
+        .map_err(|e| IdentityError::Io(e.to_string()))?;
+    Ok(())
+}
+
+/// A parsed enrollment URI containing target host, port, relay fingerprint, and one-time token.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EnrollmentUri {
-    /// Relay host or IP address.
+    /// Relay host address.
     pub host: String,
-    /// Relay port.
+    /// Relay listening UDP port.
     pub port: u16,
-    /// Relay fingerprint to pin.
-    pub fingerprint: String,
-    /// One-time enrollment token.
+    /// Relay pinned SPKI fingerprint.
+    pub relay_fingerprint: String,
+    /// Secret enrollment token.
     pub token: String,
 }
 
 impl EnrollmentUri {
-    /// Parses a `rtunnel://host:port/?fp=...&token=...` enrollment URI.
+    /// Parses an `rtunnel://<host>:<port>/?fp=<fp>&token=<token>` enrollment URI.
     ///
     /// # Errors
     ///
-    /// Returns an error when the URI is malformed or missing any required fields.
+    /// Returns an [`IdentityError::InvalidKey`] if any component is missing or invalid.
     pub fn parse(uri: &str) -> Result<Self, IdentityError> {
         let without_scheme = uri
             .strip_prefix("rtunnel://")
-            .ok_or_else(|| IdentityError::InvalidKey("URI is not rtunnel:// based".to_string()))?;
+            .ok_or_else(|| IdentityError::InvalidKey("URI must use rtunnel:// scheme".into()))?;
         let (authority, query) = without_scheme
-            .split_once('/').unwrap_or((without_scheme, ""));
-        let host_and_port = authority
-            .split_once(':')
-            .map(|(host, port)| (host.to_string(), port.to_string()))
-            .unwrap_or((authority.to_string(), "4433".to_string()));
-        let port = host_and_port
-            .1
+            .split_once('/')
+            .unwrap_or((without_scheme, ""));
+        let (host, port_str) = authority.rsplit_once(':').unwrap_or((authority, "4433"));
+        let port = port_str
             .parse::<u16>()
-            .map_err(|_| IdentityError::InvalidKey("invalid port in enrollment URI".to_string()))?;
+            .map_err(|_| IdentityError::InvalidKey("invalid port in enrollment URI".into()))?;
 
-        let mut fingerprint = None;
+        let mut fp = None;
         let mut token = None;
-        for pair in query.trim_start_matches('?').split('&').filter(|part| !part.is_empty()) {
-            let (key, value) = pair
-                .split_once('=')
-                .ok_or_else(|| IdentityError::InvalidKey("malformed enrollment parameter".to_string()))?;
-            match key {
-                "fp" => fingerprint = Some(value.to_string()),
-                "token" => token = Some(value.to_string()),
-                _ => {}
+        for pair in query.trim_start_matches('?').split('&') {
+            if let Some((k, v)) = pair.split_once('=') {
+                match k {
+                    "fp" => fp = Some(v.to_string()),
+                    "token" => token = Some(v.to_string()),
+                    _ => {}
+                }
             }
         }
-
-        let fingerprint = fingerprint.ok_or_else(|| IdentityError::InvalidKey("missing relay fingerprint".to_string()))?;
-        let token = token.ok_or_else(|| IdentityError::InvalidKey("missing enrollment token".to_string()))?;
+        let relay_fingerprint =
+            fp.ok_or_else(|| IdentityError::InvalidKey("missing relay fingerprint (fp)".into()))?;
+        let token =
+            token.ok_or_else(|| IdentityError::InvalidKey("missing enrollment token".into()))?;
 
         Ok(Self {
-            host: host_and_port.0,
+            host: host.to_string(),
             port,
-            fingerprint,
+            relay_fingerprint,
             token,
         })
     }
 }
 
-impl EnrollmentToken {
-    /// Creates a signed-looking token payload for enrollment flows.
-    #[must_use]
-    pub fn new(relay_fingerprint: &str, role: &str, name: &str) -> Self {
-        let expires_at = (Utc::now() + chrono::Duration::minutes(15)).to_rfc3339();
-        let nonce = hex_encode(&rand::random::<[u8; 16]>());
-        Self {
-            relay_fingerprint: relay_fingerprint.to_string(),
-            role: role.to_string(),
-            name: name.to_string(),
-            expires_at,
-            nonce,
-        }
-    }
-
-    /// Serializes a token into a compact string.
-    #[must_use]
-    pub fn to_uri(&self) -> String {
-        let json = serde_json::to_string(self).unwrap_or_default();
-        base64_encode(json.as_bytes())
+impl std::fmt::Display for EnrollmentUri {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "rtunnel://{}:{}/?fp={}&token={}",
+            self.host, self.port, self.relay_fingerprint, self.token
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
 
     #[test]
-    fn identity_generates_fingerprint() {
-        let identity = generate_identity("relay").unwrap();
-        assert_eq!(identity.fingerprint.len(), 64);
-        assert!(identity.certificate_pem.contains("BEGIN CERTIFICATE"));
-    }
-
-    #[test]
-    fn enrollment_uri_is_parsed() {
-        let uri = "rtunnel://relay.example.com:4433/?fp=deadbeef&token=abc123";
-        let parsed = EnrollmentUri::parse(uri).unwrap();
-        assert_eq!(parsed.host, "relay.example.com");
-        assert_eq!(parsed.port, 4433);
-        assert_eq!(parsed.fingerprint, "deadbeef");
-        assert_eq!(parsed.token, "abc123");
-    }
-
-    #[test]
-    fn unsafe_key_mode_is_rejected() {
+    fn generates_and_saves_identity() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("unsafe.pem");
-        fs::write(&path, "PRIVATE KEY\n").unwrap();
-        #[cfg(unix)]
-        {
-            let mut perms = fs::metadata(&path).unwrap().permissions();
-            perms.set_mode(0o666);
-            fs::set_permissions(&path, perms).unwrap();
-        }
-        let result = load_private_key(&path);
-        assert!(result.is_ok() || result.is_err());
+        let id = generate_identity("relay").unwrap();
+        assert_eq!(id.fingerprint.len(), 64);
+        save_identity(dir.path(), &id).unwrap();
+
+        let loaded = load_identity(dir.path()).unwrap();
+        assert_eq!(loaded.fingerprint, id.fingerprint);
+    }
+
+    #[test]
+    fn parses_enrollment_uri() {
+        let raw = "rtunnel://10.0.0.1:4433/?fp=abcdef123456&token=tok789";
+        let parsed = EnrollmentUri::parse(raw).unwrap();
+        assert_eq!(parsed.host, "10.0.0.1");
+        assert_eq!(parsed.port, 4433);
+        assert_eq!(parsed.relay_fingerprint, "abcdef123456");
+        assert_eq!(parsed.token, "tok789");
+    }
+
+    #[test]
+    fn constant_time_eq_works() {
+        assert!(constant_time_eq(b"hello", b"hello"));
+        assert!(!constant_time_eq(b"hello", b"world"));
+        assert!(!constant_time_eq(b"hello", b"hell"));
     }
 }

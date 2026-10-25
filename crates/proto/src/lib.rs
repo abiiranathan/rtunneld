@@ -1,38 +1,50 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::all, clippy::pedantic)]
+#![allow(clippy::module_name_repetitions)]
 
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{BufMut, BytesMut};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use thiserror::Error;
 
-/// Hard maximum size for a protocol frame before decoding allocates.
+/// Hard maximum size for a protocol frame in bytes before decoding allocates.
 pub const MAX_FRAME_SIZE: usize = 4 * 1024;
+
+/// Length of the framing header in bytes (big-endian 16-bit unsigned integer).
 pub const FRAME_HEADER_LEN: usize = 2;
 
-/// Stable protocol error codes sent to peers.
+/// Application-level ALPN identifier for normal authenticated tunnel sessions.
+pub const ALPN_TUNNEL: &[u8] = b"rtunnel/1";
+
+/// Application-level ALPN identifier used exclusively for one-time enrollment exchanges.
+pub const ALPN_ENROLL: &[u8] = b"rtunnel-enroll/1";
+
+/// Current protocol minor revision.
+pub const PROTOCOL_MINOR: u16 = 1;
+
+/// Stable protocol error codes exchanged between relay, agent, and client peers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ErrorCode {
     /// The client is not authorized for this agent.
-    Unauthorized,
-    /// The requested agent is offline.
-    AgentOffline,
-    /// The requested target is outside the allowed list.
-    TargetNotAllowed,
-    /// The target cannot be reached.
-    TargetUnreachable,
-    /// The connection timed out.
-    Timeout,
-    /// The peer hit a rate limit.
-    RateLimited,
-    /// The other side violated the protocol.
-    ProtocolViolation,
-    /// The peer was superseded by a newer connection.
-    Superseded,
-    /// The peer has been revoked.
-    Revoked,
-    /// Unexpected server-side failure.
-    Internal,
+    Unauthorized = 1,
+    /// The requested agent is offline or disconnected.
+    AgentOffline = 2,
+    /// The requested target is outside the agent's allowed target list.
+    TargetNotAllowed = 3,
+    /// The target socket could not be reached or connection timed out.
+    TargetUnreachable = 4,
+    /// A network or protocol handshake timeout occurred.
+    Timeout = 5,
+    /// The peer exceeded pre-authentication or session rate limits.
+    RateLimited = 6,
+    /// The remote peer violated the framing or messaging specification.
+    ProtocolViolation = 7,
+    /// The peer was superseded by a newer connection with the same identity.
+    Superseded = 8,
+    /// The peer identity has been revoked.
+    Revoked = 9,
+    /// An internal relay or agent failure occurred.
+    Internal = 10,
 }
 
 impl fmt::Display for ErrorCode {
@@ -53,156 +65,229 @@ impl fmt::Display for ErrorCode {
     }
 }
 
-/// A hostname and port pair used for target authorization.
+/// A target destination consisting of a valid hostname or IP address and a destination port.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostPort {
-    /// The hostname or literal IP that is allowed to be reached.
+    /// The destination host name or literal IP address.
     pub host: String,
     /// The destination TCP port.
     pub port: u16,
 }
 
 impl HostPort {
-    /// Parses a host:port string without accepting malformed values.
+    /// Creates a validated destination host and port pair.
     ///
     /// # Errors
     ///
-    /// Returns an error when the string is empty, missing a port, or contains an invalid port value.
-    pub fn parse(value: &str) -> Result<Self, ProtocolError> {
-        let mut pieces = value.rsplitn(2, ':');
-        let port = pieces.next().ok_or(ProtocolError::ProtocolViolation)?;
-        let host = pieces.next().unwrap_or_default();
-
-        if host.is_empty() || port.is_empty() {
+    /// Returns a [`ProtocolError::ProtocolViolation`] if the hostname is empty, exceeds 253 bytes,
+    /// or contains control characters.
+    pub fn new(host: impl Into<String>, port: u16) -> Result<Self, ProtocolError> {
+        let host = host.into();
+        Self::validate_host(&host)?;
+        if port == 0 {
             return Err(ProtocolError::ProtocolViolation);
         }
+        Ok(Self { host, port })
+    }
 
-        let port_number = port
+    /// Parses a string formatted as `host:port`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProtocolError::ProtocolViolation`] when the input is malformed, lacks a port,
+    /// or contains an invalid host or port.
+    pub fn parse(value: &str) -> Result<Self, ProtocolError> {
+        let (host, port_str) = value
+            .rsplit_once(':')
+            .ok_or(ProtocolError::ProtocolViolation)?;
+        let port = port_str
             .parse::<u16>()
             .map_err(|_| ProtocolError::ProtocolViolation)?;
-        Ok(Self {
-            host: host.to_string(),
-            port: port_number,
-        })
+        Self::new(host, port)
+    }
+
+    fn validate_host(host: &str) -> Result<(), ProtocolError> {
+        if host.is_empty() || host.len() > 253 {
+            return Err(ProtocolError::ProtocolViolation);
+        }
+        if host
+            .chars()
+            .any(|c| c.is_ascii_control() || c.is_whitespace())
+        {
+            return Err(ProtocolError::ProtocolViolation);
+        }
+        Ok(())
     }
 }
 
-/// Result of opening a target socket on the agent side.
+impl fmt::Display for HostPort {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.host, self.port)
+    }
+}
+
+/// Status reported by the agent after attempting to connect to a target.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResultStatus {
+    /// The destination socket was dialed successfully.
     Ok,
+    /// Dialing the destination socket failed with the specified error code.
     Err(ErrorCode),
 }
 
-/// Control frames exchanged on the QUIC stream.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ControlMessage {
-    /// Initial protocol handshake from a peer.
-    Hello {
-        protocol_minor: u16,
-        features: Vec<String>,
-    },
-    /// Relay acknowledges a known agent or client.
-    HelloAck { agent_name: String },
-    /// A generic failure from the opposite side.
-    Error { code: ErrorCode, message: String },
-    /// Agent announces itself and its hostname.
-    AgentHello {
-        protocol_minor: u16,
-        agent_version: String,
-        hostname: String,
-    },
-    /// Client requests a connection to an agent.
-    ConnectRequest {
-        agent: String,
-        target: Option<HostPort>,
-    },
-    /// Relay instructs the agent to open a target.
-    OpenTarget {
-        session_id: String,
-        client_name: String,
-        host: String,
-        port: u16,
-    },
-    /// Agent reports the result of opening the target.
-    OpenResult {
-        session_id: String,
-        status: ResultStatus,
-    },
-    /// Relay forwards a target opening result to the client.
-    ConnectResponse {
-        session_id: String,
-        status: ResultStatus,
-    },
-    /// Client asks for the list of granted agents.
-    ListAgents { client_name: String },
-    /// Relay lists agent availability.
-    ListAgentsResponse { agents: Vec<AgentInfo> },
-    /// Agent registration is closing down.
-    Shutdown { reason: String },
-    /// The peer has been revoked.
-    Revoked { reason: String },
-}
-
-/// Describes a remote endpoint that may be online.
+/// Information describing a registered agent.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentInfo {
-    /// The agent's configured name.
+    /// The unique name of the agent.
     pub name: String,
-    /// Whether the relay has an active connection to the agent.
+    /// Whether the agent currently holds an active connection to the relay.
     pub online: bool,
 }
 
-/// Errors raised when decoding or encoding a wire frame.
-#[derive(Debug, Error, PartialEq, Eq)]
-pub enum ProtocolError {
-    /// The incoming frame exceeds allowed memory limits.
-    #[error("frame exceeds max size")]
-    OversizedFrame,
-    /// A frame contains trailing bytes after a valid message.
-    #[error("trailing bytes remain")]
-    TrailingBytes,
-    /// A supported variant was not recognized.
-    #[error("unknown protocol variant")]
-    UnknownVariant,
-    /// Wire data is malformed.
-    #[error("protocol violation")]
-    ProtocolViolation,
-    /// An I/O-related issue occurred during encoding.
-    #[error("I/O error: {0}")]
-    Io(String),
+/// Control messages exchanged over QUIC bidirectional streams.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ControlMessage {
+    /// Initial client capability greeting.
+    Hello {
+        /// Minor version of the peer protocol implementation.
+        protocol_minor: u16,
+        /// List of supported feature strings.
+        features: Vec<String>,
+    },
+    /// Relay acknowledgement of greeting.
+    HelloAck {
+        /// Assigned peer name confirmed by the relay.
+        agent_name: String,
+    },
+    /// Agent announcement upon completing the TLS handshake.
+    AgentHello {
+        /// Minor version of the peer protocol implementation.
+        protocol_minor: u16,
+        /// Software version of the connecting agent.
+        agent_version: String,
+        /// Machine hostname where the agent runs.
+        hostname: String,
+    },
+    /// Client request to connect to a named agent and optional target.
+    ConnectRequest {
+        /// Target agent name.
+        agent: String,
+        /// Destination host and port, or `None` for agent default.
+        target: Option<HostPort>,
+    },
+    /// Relay instruction directing an agent to open a TCP target socket.
+    OpenTarget {
+        /// Stable session identifier for auditing and telemetry.
+        session_id: String,
+        /// Authenticated client name initiating the connection.
+        client_name: String,
+        /// Target destination host.
+        host: String,
+        /// Target destination port.
+        port: u16,
+    },
+    /// Agent response indicating whether the target socket was opened.
+    OpenResult {
+        /// Stable session identifier.
+        session_id: String,
+        /// Status of the open attempt.
+        status: ResultStatus,
+    },
+    /// Relay response to the client indicating whether the tunnel session is ready.
+    ConnectResponse {
+        /// Stable session identifier.
+        session_id: String,
+        /// Final status of the connection request.
+        status: ResultStatus,
+    },
+    /// Client query requesting the list of accessible agents.
+    ListAgents {
+        /// Authenticated client name.
+        client_name: String,
+    },
+    /// Relay listing of agents granted to the requesting client.
+    ListAgentsResponse {
+        /// Granted agent statuses.
+        agents: Vec<AgentInfo>,
+    },
+    /// Peer request to enroll using a one-time token.
+    Enroll {
+        /// Secret one-time enrollment token.
+        token: String,
+    },
+    /// Relay confirmation of successful enrollment.
+    EnrollAck {
+        /// Enrolled peer name.
+        name: String,
+        /// Assigned peer role (`"agent"` or `"client"`).
+        role: String,
+    },
+    /// Notification that the relay is shutting down gracefully.
+    Shutdown {
+        /// Human-readable explanation.
+        reason: String,
+    },
+    /// Notification that the peer's authorization has been revoked.
+    Revoked {
+        /// Human-readable explanation.
+        reason: String,
+    },
+    /// Generic error notification.
+    Error {
+        /// Machine-readable error code.
+        code: ErrorCode,
+        /// Human-readable error message.
+        message: String,
+    },
 }
 
-/// Encode a control message into a length-prefixed frame.
+/// Errors occurring during control frame serialization or decoding.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ProtocolError {
+    /// The serialized or declared frame size exceeds [`MAX_FRAME_SIZE`].
+    #[error("frame size exceeds maximum limit of {MAX_FRAME_SIZE} bytes")]
+    OversizedFrame,
+    /// Unconsumed trailing bytes were detected after decoding a valid message.
+    #[error("trailing unconsumed bytes after frame")]
+    TrailingBytes,
+    /// The wire data could not be parsed into a recognized message.
+    #[error("protocol violation: malformed frame payload")]
+    ProtocolViolation,
+    /// An internal serialization error occurred.
+    #[error("serialization error: {0}")]
+    Serialization(String),
+}
+
+/// Encodes a [`ControlMessage`] into a length-prefixed wire frame.
 ///
 /// # Errors
 ///
-/// Returns an error when the message is too large or serialization fails.
+/// Returns [`ProtocolError::OversizedFrame`] if the message serialized representation
+/// exceeds [`MAX_FRAME_SIZE`].
 pub fn encode_frame(message: &ControlMessage) -> Result<Vec<u8>, ProtocolError> {
-    let bytes = postcard::to_allocvec(message).map_err(|err| ProtocolError::Io(err.to_string()))?;
-    if bytes.len() > MAX_FRAME_SIZE {
+    let payload = postcard::to_allocvec(message)
+        .map_err(|err| ProtocolError::Serialization(err.to_string()))?;
+    if payload.len() > MAX_FRAME_SIZE {
         return Err(ProtocolError::OversizedFrame);
     }
-
-    let length = u16::try_from(bytes.len()).map_err(|_| ProtocolError::OversizedFrame)?;
-    let mut out = BytesMut::with_capacity(FRAME_HEADER_LEN + bytes.len());
+    let length = u16::try_from(payload.len()).map_err(|_| ProtocolError::OversizedFrame)?;
+    let mut out = BytesMut::with_capacity(FRAME_HEADER_LEN + payload.len());
     out.put_u16(length);
-    out.extend_from_slice(&bytes);
+    out.extend_from_slice(&payload);
     Ok(out.to_vec())
 }
 
-/// Decode a single control frame from a byte slice.
+/// Decodes a [`ControlMessage`] and consumed byte count from a wire buffer.
 ///
 /// # Errors
 ///
-/// Returns an error when the buffer is too short, oversized, or contains malformed data.
+/// Returns [`ProtocolError::OversizedFrame`] if the declared frame length exceeds [`MAX_FRAME_SIZE`],
+/// or [`ProtocolError::ProtocolViolation`] if the buffer is incomplete or corrupt.
 pub fn decode_frame(buf: &[u8]) -> Result<(ControlMessage, usize), ProtocolError> {
     if buf.len() < FRAME_HEADER_LEN {
         return Err(ProtocolError::ProtocolViolation);
     }
-
-    let mut reader = buf;
-    let length = reader.get_u16() as usize;
+    let length = usize::from(u16::from_be_bytes([buf[0], buf[1]]));
     if length > MAX_FRAME_SIZE {
         return Err(ProtocolError::OversizedFrame);
     }
@@ -210,28 +295,10 @@ pub fn decode_frame(buf: &[u8]) -> Result<(ControlMessage, usize), ProtocolError
     if buf.len() < total {
         return Err(ProtocolError::ProtocolViolation);
     }
-
     let payload = &buf[FRAME_HEADER_LEN..total];
     let message: ControlMessage =
         postcard::from_bytes(payload).map_err(|_| ProtocolError::ProtocolViolation)?;
-
     Ok((message, total))
-}
-
-/// Validate that a byte stream does not end with embedded extra bytes.
-///
-/// # Errors
-///
-/// Returns an error when the stream contains trailing frame bytes or invalid frame metadata.
-pub fn ensure_no_trailing_bytes(buf: &[u8]) -> Result<(), ProtocolError> {
-    if buf.is_empty() {
-        return Ok(());
-    }
-    let _ = decode_frame(buf)?;
-    if buf.len() > FRAME_HEADER_LEN + MAX_FRAME_SIZE {
-        return Err(ProtocolError::TrailingBytes);
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -240,84 +307,89 @@ mod tests {
     use proptest::prelude::*;
 
     fn arb_host_port() -> impl Strategy<Value = HostPort> {
-        ("[a-z0-9.-]{1,32}", 1u16..=65535).prop_map(|(host, port)| HostPort { host, port })
+        ("[a-z0-9.-]{1,32}", 1u16..=65535).prop_filter_map("valid hostport", |(host, port)| {
+            HostPort::new(host, port).ok()
+        })
     }
 
     fn arb_message() -> impl Strategy<Value = ControlMessage> {
         prop_oneof![
-            (
-                "[a-z0-9-]{1,16}",
-                0u16..=10,
-                prop::collection::vec("[a-z0-9-]{0,16}", 0..=4)
-            )
-                .prop_map(|(_agent, minor, features)| ControlMessage::Hello {
+            (0u16..=10, prop::collection::vec("[a-z0-9-]{0,16}", 0..=4)).prop_map(
+                |(minor, features)| ControlMessage::Hello {
                     protocol_minor: minor,
                     features,
+                }
+            ),
+            "[a-z0-9-]{1,16}".prop_map(|agent_name| ControlMessage::HelloAck { agent_name }),
+            ("[a-z0-9-]{1,16}", "[a-z0-9-]{1,16}").prop_map(|(agent_version, hostname)| {
+                ControlMessage::AgentHello {
+                    protocol_minor: PROTOCOL_MINOR,
+                    agent_version,
+                    hostname,
+                }
+            }),
+            ("[a-z0-9-]{1,16}", prop::option::of(arb_host_port()))
+                .prop_map(|(agent, target)| { ControlMessage::ConnectRequest { agent, target } }),
+            (
+                "[a-z0-9-]{1,16}",
+                "[a-z0-9-]{1,16}",
+                "[a-z0-9.-]{1,16}",
+                1u16..=65535
+            )
+                .prop_map(|(session_id, client_name, host, port)| {
+                    ControlMessage::OpenTarget {
+                        session_id,
+                        client_name,
+                        host,
+                        port,
+                    }
                 }),
-            ("[a-z0-9-]{1,16}", "[a-z0-9-]{1,16}", "[a-z0-9-]{1,16}").prop_map(
-                |(_name, host, version)| ControlMessage::AgentHello {
-                    protocol_minor: 1,
-                    agent_version: version,
-                    hostname: host,
-                }
-            ),
-            ("[a-z0-9-]{1,16}", arb_host_port()).prop_map(|(agent, target)| {
-                ControlMessage::ConnectRequest {
-                    agent,
-                    target: Some(target),
-                }
+            ("[a-z0-9-]{1,16}").prop_map(|session_id| ControlMessage::OpenResult {
+                session_id,
+                status: ResultStatus::Ok,
             }),
-            ("[a-z0-9-]{1,16}", "[a-z0-9-]{1,16}", any::<u16>()).prop_map(
-                |(session_id, client_name, port)| ControlMessage::OpenTarget {
-                    session_id,
-                    client_name,
-                    host: "db1.lan".to_string(),
-                    port,
-                }
-            ),
-            ("[a-z0-9-]{1,16}", "[a-z0-9-]{1,16}").prop_map(|(session_id, _status)| {
-                ControlMessage::OpenResult {
-                    session_id,
-                    status: ResultStatus::Ok,
-                }
+            ("[a-z0-9-]{1,16}").prop_map(|session_id| ControlMessage::ConnectResponse {
+                session_id,
+                status: ResultStatus::Ok,
             }),
-            ("[a-z0-9-]{1,16}", any::<bool>()).prop_map(|(name, online)| {
-                ControlMessage::ListAgentsResponse {
-                    agents: vec![AgentInfo { name, online }],
-                }
-            }),
+            "[a-z0-9-]{1,16}".prop_map(|token| ControlMessage::Enroll { token }),
+            ("[a-z0-9-]{1,16}", "[a-z0-9-]{1,16}")
+                .prop_map(|(name, role)| ControlMessage::EnrollAck { name, role }),
         ]
     }
 
     #[test]
-    fn encode_decode_round_trip() {
-        let message = ControlMessage::ConnectRequest {
-            agent: "clinic-a".to_string(),
-            target: Some(HostPort {
-                host: "db1.lan".to_string(),
-                port: 5432,
-            }),
+    fn round_trip_connect_request() {
+        let msg = ControlMessage::ConnectRequest {
+            agent: "agent-1".into(),
+            target: Some(HostPort::new("127.0.0.1", 22).unwrap()),
         };
-
-        let encoded = encode_frame(&message).unwrap();
-        let (decoded, len) = decode_frame(&encoded).unwrap();
-        assert_eq!(decoded, message);
-        assert_eq!(len, encoded.len());
+        let encoded = encode_frame(&msg).unwrap();
+        let (decoded, consumed) = decode_frame(&encoded).unwrap();
+        assert_eq!(decoded, msg);
+        assert_eq!(consumed, encoded.len());
     }
 
     #[test]
-    fn oversized_frame_rejected() {
-        let mut payload = vec![0u8; MAX_FRAME_SIZE + 1];
-        payload[0..2].copy_from_slice(&(u16::try_from(MAX_FRAME_SIZE).unwrap() + 1).to_be_bytes());
-        assert!(decode_frame(&payload).is_err());
+    fn rejects_oversized_frame() {
+        let mut raw = vec![0u8; 10];
+        let len = u16::try_from(MAX_FRAME_SIZE + 1).unwrap();
+        raw[0..2].copy_from_slice(&len.to_be_bytes());
+        assert_eq!(decode_frame(&raw), Err(ProtocolError::OversizedFrame));
     }
 
     proptest! {
         #[test]
-        fn any_message_round_trips(message in arb_message()) {
-            let bytes = encode_frame(&message).unwrap();
-            let (decoded, _) = decode_frame(&bytes).unwrap();
-            prop_assert_eq!(decoded, message);
+        fn round_trip_property(msg in arb_message()) {
+            let encoded = encode_frame(&msg).unwrap();
+            let (decoded, consumed) = decode_frame(&encoded).unwrap();
+            prop_assert_eq!(decoded, msg);
+            prop_assert_eq!(consumed, encoded.len());
+        }
+
+        #[test]
+        fn arbitrary_bytes_never_panic(bytes in prop::collection::vec(any::<u8>(), 0..5000)) {
+            let _ = decode_frame(&bytes);
         }
     }
 }

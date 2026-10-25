@@ -6,6 +6,7 @@ members = [
   "crates/relay",
   "crates/agent",
   "crates/client",
+  "tests",
 ]
 resolver = "2"
 
@@ -28,9 +29,12 @@ quinn = "0.11"
 rand = "0.8"
 rcgen = "0.13"
 rusqlite = { version = "0.33", features = ["bundled"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pki-types = "1.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
+tempfile = "3.13"
 thiserror = "2.0"
 tokio = { version = "1.39", features = ["full"] }
 tokio-util = "0.7"

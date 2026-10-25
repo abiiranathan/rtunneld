@@ -10,9 +10,13 @@ name = "rtunnel_transport"
 
 [dependencies]
 bytes = { workspace = true }
+postcard = { workspace = true }
 quinn = { workspace = true }
-tokio = { workspace = true }
+rand = { workspace = true }
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
 thiserror = { workspace = true }
-
-[dev-dependencies]
-tokio = { workspace = true, features = ["rt", "io-util", "net", "macros"] }
+tokio = { workspace = true }
+tracing = { workspace = true }
+rtunnel-proto = { path = "../proto" }
+rtunnel-identity = { path = "../identity" }

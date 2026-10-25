@@ -1,0 +1,22 @@
+[Unit]
+Description=rtunnel relay daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/rtunneld serve --state-dir /var/lib/rtunnel --listen 0.0.0.0:4433
+StateDirectory=rtunnel
+RuntimeDirectory=rtunnel
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,14 +1,49 @@
 version: "3.9"
+
 services:
-  rtunneld:
+  relay:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
-    command: ["/usr/local/bin/rtunneld", "serve"]
+    command:
+      [
+        "/usr/local/bin/rtunneld",
+        "serve",
+        "--state-dir",
+        "/var/lib/rtunnel",
+        "--listen",
+        "0.0.0.0:4433",
+      ]
     ports:
       - "4433:4433/udp"
     volumes:
-      - rtunnel-state:/var/lib/rtunnel
+      - relay_data:/var/lib/rtunnel
+
+  sshd-host:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    command: ["/usr/sbin/sshd", "-D", "-e"]
+    environment:
+      - SSH_ENABLE_ROOT=true
+
+  agent:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    command:
+      [
+        "/usr/local/bin/rtunnel-agent",
+        "run",
+        "--state-dir",
+        "/var/lib/rtunnel-agent",
+      ]
+    depends_on:
+      - relay
+      - sshd-host
+    volumes:
+      - agent_data:/var/lib/rtunnel-agent
 
 volumes:
-  rtunnel-state:
+  relay_data:
+  agent_data:

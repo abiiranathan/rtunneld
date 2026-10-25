@@ -5,15 +5,25 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[lib]
+name = "rtunnel_relay"
+
 [[bin]]
 name = "rtunneld"
 path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
+chrono = { workspace = true }
 clap = { workspace = true }
+quinn = { workspace = true }
+rand = { workspace = true }
+rustls = { workspace = true }
+directories = { workspace = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

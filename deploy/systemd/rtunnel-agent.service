@@ -1,11 +1,11 @@
 [Unit]
-Description=rtunnel agent
+Description=rtunnel agent connector
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/rtunnel-agent run
+ExecStart=/usr/local/bin/rtunnel-agent run --state-dir /var/lib/rtunnel-agent
 StateDirectory=rtunnel-agent
 RuntimeDirectory=rtunnel-agent
 UMask=0077
