@@ -110,7 +110,11 @@ async fn main() -> Result<()> {
             let id = load_identity(&cli.state_dir)
                 .context("failed to load agent identity; run 'enroll' first")?;
             let runner = AgentRunner::new(config, id);
-            runner.run().await;
+            runner
+                .run()
+                .await
+                .map_err(anyhow::Error::msg)
+                .context("agent runner failed to start")?;
         }
     }
     Ok(())

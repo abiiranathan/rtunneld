@@ -23,9 +23,12 @@ pub fn make_transport_config(max_bidi: u64) -> Arc<TransportConfig> {
         IdleTimeout::try_from(limits::MAX_IDLE_TIMEOUT).expect("valid idle duration"),
     ));
     config.keep_alive_interval(Some(limits::KEEPALIVE_INTERVAL));
-    config.stream_receive_window(VarInt::from_u32(u32::try_from(limits::MAX_STREAM_RECEIVE_WINDOW).expect("valid stream receive window")));
+    config.stream_receive_window(VarInt::from_u32(
+        u32::try_from(limits::MAX_STREAM_RECEIVE_WINDOW).expect("valid stream receive window"),
+    ));
     config.receive_window(VarInt::from_u32(
-        u32::try_from(limits::MAX_CONNECTION_RECEIVE_WINDOW).expect("valid connection receive window"),
+        u32::try_from(limits::MAX_CONNECTION_RECEIVE_WINDOW)
+            .expect("valid connection receive window"),
     ));
     config.max_concurrent_bidi_streams(VarInt::from_u64(max_bidi).expect("valid bidi limit"));
     Arc::new(config)

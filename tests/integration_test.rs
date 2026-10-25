@@ -24,7 +24,9 @@ struct TestHarness {
 }
 
 impl TestHarness {
-    async fn start() -> Self {
+    // Not `async`: nothing is awaited here. The relay's run loop is spawned
+    // onto the ambient tokio runtime, which every `#[tokio::test]` provides.
+    fn start() -> Self {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let temp_dir = tempfile::tempdir().unwrap();
         let store = Arc::new(SqliteStore::open(temp_dir.path().join("test.db")).unwrap());
@@ -62,11 +64,14 @@ impl TestHarness {
     fn make_token(&self, name: &str, role: &str) -> (String, EnrollmentUri) {
         let token = format!("token-{}", rand::random::<u64>());
         let token_hash = rtunnel_identity::hex_encode(&Sha256::digest(token.as_bytes()));
+        // A Unix timestamp plus ten minutes cannot exceed i64::MAX, so the
+        // sign reinterpretation is lossless.
         let expires_at = (std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs()
-            + 600) as i64;
+            + 600)
+            .cast_signed();
         self.store
             .store_token(&token_hash, name, role, expires_at)
             .unwrap();
@@ -129,9 +134,10 @@ async fn start_echo_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     });
     (addr, handle)
 }
+
 #[tokio::test]
 async fn test_full_tunnel_data_transfer_and_hash_integrity() {
-    let harness = TestHarness::start().await;
+    let harness = TestHarness::start();
     let (echo_addr, _echo_handle) = start_echo_server().await;
 
     let agent_id = harness.enroll_peer("agent-1", "agent").await;
@@ -191,12 +197,10 @@ async fn test_full_tunnel_data_transfer_and_hash_integrity() {
         }
     );
 
-    // Stream 1 MiB of pseudo-random data through the tunnel and verify SHA-256 integrity
+    // Stream 1 MiB of patterned data through the tunnel and verify SHA-256 integrity.
+    // The pattern repeats 0..=250, which avoids a lossy usize -> u8 cast.
     let data_size = 1024 * 1024;
-    let mut payload = vec![0u8; data_size];
-    for (i, b) in payload.iter_mut().enumerate() {
-        *b = (i % 251) as u8;
-    }
+    let payload: Vec<u8> = (0..=250_u8).cycle().take(data_size).collect();
     let expected_hash = Sha256::digest(&payload);
 
     let sender = async {
@@ -207,23 +211,20 @@ async fn test_full_tunnel_data_transfer_and_hash_integrity() {
     let receiver = async {
         let mut received = Vec::with_capacity(data_size);
         let mut buf = vec![0u8; 16 * 1024];
-        loop {
-            match recv.read(&mut buf).await.unwrap() {
-                Some(n) => received.extend_from_slice(&buf[..n]),
-                None => break,
-            }
+        while let Some(n) = recv.read(&mut buf).await.unwrap() {
+            received.extend_from_slice(&buf[..n]);
         }
         received
     };
 
-    let (_, received_data) = tokio::join!(sender, receiver);
+    let ((), received_data) = tokio::join!(sender, receiver);
     let actual_hash = Sha256::digest(&received_data);
     assert_eq!(actual_hash, expected_hash);
 }
 
 #[tokio::test]
 async fn test_unauthorized_client_rejected() {
-    let harness = TestHarness::start().await;
+    let harness = TestHarness::start();
     let agent_id = harness.enroll_peer("agent-2", "agent").await;
     let client_id = harness.enroll_peer("client-unauthorized", "client").await;
     // Note: No grant added between client-unauthorized and agent-2
@@ -283,7 +284,7 @@ async fn test_unauthorized_client_rejected() {
 
 #[tokio::test]
 async fn test_disallowed_target_rejected_by_agent() {
-    let harness = TestHarness::start().await;
+    let harness = TestHarness::start();
     let agent_id = harness.enroll_peer("agent-3", "agent").await;
     let client_id = harness.enroll_peer("client-3", "client").await;
     harness.store.add_grant("client-3", "agent-3").unwrap();
@@ -344,8 +345,10 @@ async fn test_disallowed_target_rejected_by_agent() {
 
 #[tokio::test]
 async fn test_revocation_terminates_agent_live_session() {
-    let harness = TestHarness::start().await;
+    let harness = TestHarness::start();
     let agent_id = harness.enroll_peer("agent-rev", "agent").await;
+    let client_id = harness.enroll_peer("client-rev", "client").await;
+    harness.store.add_grant("client-rev", "agent-rev").unwrap();
 
     let agent_cfg = AgentConfig {
         relay_host: harness.relay_addr.ip().to_string(),
@@ -355,24 +358,79 @@ async fn test_revocation_terminates_agent_live_session() {
         allowed_targets: vec!["127.0.0.1:22".into()],
         max_sessions: 64,
     };
-    tokio::spawn(AgentRunner::new(agent_cfg, agent_id.clone()).run());
+    tokio::spawn(AgentRunner::new(agent_cfg, agent_id).run());
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // Revoke the agent in the SQLite store
+    // A granted client observes the relay's live agent registry via ListAgents.
+    let endpoint = create_client_endpoint("0.0.0.0:0".parse().unwrap()).unwrap();
+    let verifier = Arc::new(PinnedServerVerifier::new(
+        &harness.relay_identity.fingerprint,
+    ));
+    let client_config = make_client_config(
+        &client_id.certificate_der,
+        &client_id.private_key_pem,
+        verifier,
+        vec![ALPN_TUNNEL.to_vec()],
+    )
+    .unwrap();
+
+    let conn = endpoint
+        .connect_with(
+            client_config,
+            harness.relay_addr,
+            &harness.relay_addr.ip().to_string(),
+        )
+        .unwrap()
+        .await
+        .unwrap();
+
+    // Each query uses a fresh bidirectional stream on the same client connection.
+    // A closure (rather than a helper fn) avoids naming quinn's connection type here.
+    let conn_ref = &conn;
+    let agent_is_online = || async move {
+        let (mut send, mut recv) = conn_ref.open_bi().await.unwrap();
+        write_frame(
+            &mut send,
+            &ControlMessage::ListAgents {
+                client_name: "client-rev".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let ControlMessage::ListAgentsResponse { agents } = read_frame(&mut recv).await.unwrap()
+        else {
+            panic!("expected ListAgentsResponse");
+        };
+        agents
+            .iter()
+            .find(|a| a.name == "agent-rev")
+            .expect("granted agent must be listed")
+            .online
+    };
+
+    // Precondition: the agent is registered and live before revocation.
+    assert!(
+        agent_is_online().await,
+        "agent should be online before revocation"
+    );
+
+    // Revoke the agent in the SQLite store.
     assert!(harness.store.revoke_peer("agent-rev").unwrap());
 
-    // The revocation watcher on the relay polls once per second and terminates live connections
+    // The revocation watcher on the relay polls once per second and terminates live
+    // connections. The agent's reconnect attempts are rejected because it is revoked.
     tokio::time::sleep(Duration::from_millis(2500)).await;
 
-    // Confirm agent registration was purged from the relay
-    let peers = harness.store.list_peers().unwrap();
-    let rev_peer = peers.iter().find(|p| p.name == "agent-rev").unwrap();
-    assert!(rev_peer.revoked);
+    // The relay itself must have dropped the live session, not merely the store flag.
+    assert!(
+        !agent_is_online().await,
+        "relay should have dropped the revoked agent's live connection"
+    );
 }
 
 #[tokio::test]
 async fn test_half_close_preservation() {
-    let harness = TestHarness::start().await;
+    let harness = TestHarness::start();
     let (echo_addr, _echo_handle) = start_echo_server().await;
 
     let agent_id = harness.enroll_peer("agent-half", "agent").await;

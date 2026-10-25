@@ -11,12 +11,16 @@ use rtunnel_transport::{
     Backoff, create_client_endpoint, limits, make_client_config, read_frame, splice_quic_to_tcp,
     write_frame,
 };
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::Instant;
-use tokio::net::TcpStream;
+use std::time::{Duration, Instant};
+use tokio::net::{TcpStream, lookup_host};
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
+
+/// A relay session that lasted at least this long is considered healthy, and the
+/// reconnect backoff is reset once it ends.
+const HEALTHY_SESSION_THRESHOLD: Duration = Duration::from_secs(60);
 
 /// Agent connector that executes the resilient connection loop to the relay.
 pub struct AgentRunner {
@@ -38,15 +42,23 @@ impl AgentRunner {
     }
 
     /// Runs the infinite reconnection loop using exponential backoff and full jitter.
-    pub async fn run(self) {
+    ///
+    /// Relay resolution and connection failures are logged and retried; they never
+    /// terminate the loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the local QUIC client endpoint or the TLS client
+    /// configuration cannot be created. Once setup succeeds this function does not
+    /// return.
+    pub async fn run(self) -> Result<(), String> {
         let mut backoff = Backoff::default();
-        let target_addr: SocketAddr =
-            format!("{}:{}", self.config.relay_host, self.config.relay_port)
-                .parse()
-                .expect("valid relay address");
 
-        let bind_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
-        let endpoint = create_client_endpoint(bind_addr).expect("client endpoint created");
+        // Wildcard IPv4 address with an OS-assigned port. Built from typed parts
+        // so there is no string parsing that could fail.
+        let bind_addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0));
+        let endpoint = create_client_endpoint(bind_addr)
+            .map_err(|e| format!("cannot create client endpoint: {e}"))?;
 
         let verifier = Arc::new(PinnedServerVerifier::new(&self.config.relay_fingerprint));
         let client_config = make_client_config(
@@ -55,27 +67,34 @@ impl AgentRunner {
             verifier,
             vec![ALPN_TUNNEL.to_vec()],
         )
-        .expect("client config created");
+        .map_err(|e| format!("cannot create client config: {e}"))?;
 
         loop {
-            info!(relay = %target_addr, "dialing relay");
             let connect_start = Instant::now();
-            let connect_fut =
-                endpoint.connect_with(client_config.clone(), target_addr, &self.config.relay_host);
 
-            let connecting = match connect_fut {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!(error = %e, "connection initialization failed");
-                    tokio::time::sleep(backoff.next_delay()).await;
-                    continue;
-                }
+            // Resolve (so hostnames work, not only IP literals) and dial in one
+            // fallible unit so every failure shares a single retry path below.
+            let attempt = async {
+                let target_addr =
+                    lookup_host((self.config.relay_host.as_str(), self.config.relay_port))
+                        .await
+                        .map_err(|e| format!("cannot resolve relay address: {e}"))?
+                        // The client endpoint is bound to an IPv4 socket.
+                        .find(SocketAddr::is_ipv4)
+                        .ok_or_else(|| String::from("relay has no IPv4 address"))?;
+
+                info!(relay = %target_addr, "dialing relay");
+                endpoint
+                    .connect_with(client_config.clone(), target_addr, &self.config.relay_host)
+                    .map_err(|e| format!("connection initialization failed: {e}"))?
+                    .await
+                    .map_err(|e| format!("relay TLS/QUIC handshake failed: {e}"))
             };
 
-            let connection = match connecting.await {
+            let connection = match attempt.await {
                 Ok(c) => c,
                 Err(e) => {
-                    warn!(error = %e, "relay TLS/QUIC handshake failed");
+                    warn!(error = %e, "relay dial failed");
                     tokio::time::sleep(backoff.next_delay()).await;
                     continue;
                 }
@@ -84,7 +103,7 @@ impl AgentRunner {
             info!("connected to relay; initializing control session");
             let session_res = self.handle_relay_connection(&connection).await;
 
-            if connect_start.elapsed().as_secs() >= 60 {
+            if connect_start.elapsed() >= HEALTHY_SESSION_THRESHOLD {
                 backoff.reset();
             }
 
@@ -129,12 +148,9 @@ impl AgentRunner {
 
         let stream_acceptor = async {
             while let Ok((send, recv)) = connection.accept_bi().await {
-                let permit = match self.session_limiter.clone().try_acquire_owned() {
-                    Ok(p) => p,
-                    Err(_) => {
-                        warn!("maximum concurrent sessions exceeded; dropping incoming stream");
-                        continue;
-                    }
+                let Ok(permit) = Arc::clone(&self.session_limiter).try_acquire_owned() else {
+                    warn!("maximum concurrent sessions exceeded; dropping incoming stream");
+                    continue;
                 };
                 let allowed_targets = self.config.allowed_targets.clone();
                 tokio::spawn(async move {
@@ -157,9 +173,8 @@ async fn handle_target_stream(
     mut recv: RecvStream,
     allowed_targets: &[String],
 ) {
-    let msg = match read_frame(&mut recv).await {
-        Ok(m) => m,
-        Err(_) => return,
+    let Ok(msg) = read_frame(&mut recv).await else {
+        return;
     };
 
     let ControlMessage::OpenTarget {
@@ -184,20 +199,18 @@ async fn handle_target_stream(
             session_id,
             status: ResultStatus::Err(ErrorCode::TargetNotAllowed),
         };
+        // Best effort: the peer may already have gone away.
         let _ = write_frame(&mut send, &resp).await;
         return;
     }
 
-    let hp = match HostPort::parse(&target_str) {
-        Ok(hp) => hp,
-        Err(_) => {
-            let resp = ControlMessage::OpenResult {
-                session_id,
-                status: ResultStatus::Err(ErrorCode::TargetNotAllowed),
-            };
-            let _ = write_frame(&mut send, &resp).await;
-            return;
-        }
+    let Ok(hp) = HostPort::parse(&target_str) else {
+        let resp = ControlMessage::OpenResult {
+            session_id,
+            status: ResultStatus::Err(ErrorCode::TargetNotAllowed),
+        };
+        let _ = write_frame(&mut send, &resp).await;
+        return;
     };
 
     let dial_res = tokio::time::timeout(
@@ -206,21 +219,21 @@ async fn handle_target_stream(
     )
     .await;
 
-    let tcp = match dial_res {
-        Ok(Ok(stream)) => {
-            let _ = stream.set_nodelay(true);
-            stream
-        }
-        _ => {
-            warn!(target = %target_str, "target destination unreachable");
-            let resp = ControlMessage::OpenResult {
-                session_id,
-                status: ResultStatus::Err(ErrorCode::TargetUnreachable),
-            };
-            let _ = write_frame(&mut send, &resp).await;
-            return;
-        }
+    // Both a timeout (outer Err) and a connect failure (inner Err) are "unreachable".
+    let Ok(Ok(tcp)) = dial_res else {
+        warn!(target = %target_str, "target destination unreachable");
+        let resp = ControlMessage::OpenResult {
+            session_id,
+            status: ResultStatus::Err(ErrorCode::TargetUnreachable),
+        };
+        let _ = write_frame(&mut send, &resp).await;
+        return;
     };
+
+    // A failure here only costs latency, so log it and carry on.
+    if let Err(e) = tcp.set_nodelay(true) {
+        warn!(target = %target_str, error = %e, "cannot enable TCP_NODELAY");
+    }
 
     let resp = ControlMessage::OpenResult {
         session_id,
@@ -230,6 +243,7 @@ async fn handle_target_stream(
         return;
     }
 
+    // The splice ends when either side closes; its result carries nothing actionable.
     let _ = splice_quic_to_tcp(send, recv, tcp).await;
 }
 

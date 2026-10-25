@@ -39,6 +39,32 @@ struct AuditRecord<'a> {
     action: Option<&'a str>,
 }
 
+/// Identifies a relay session in audit records.
+#[derive(Debug, Clone, Copy)]
+pub struct SessionRef<'a> {
+    /// Name of the client that opened the session.
+    pub client: &'a str,
+    /// Name of the agent serving the session.
+    pub agent: &'a str,
+    /// Destination on the agent LAN, or `"default"`.
+    pub target: &'a str,
+    /// Unique session identifier.
+    pub session_id: &'a str,
+}
+
+/// How a relay session ended.
+#[derive(Debug, Clone, Copy)]
+pub struct SessionOutcome<'a> {
+    /// Bytes relayed from client to agent.
+    pub bytes_up: u64,
+    /// Bytes relayed from agent to client.
+    pub bytes_down: u64,
+    /// Session lifetime in milliseconds.
+    pub duration_ms: u128,
+    /// Human-readable termination reason.
+    pub reason: &'a str,
+}
+
 impl AuditLogger {
     /// Opens or creates the append-only JSONL audit log in the specified state directory.
     ///
@@ -54,10 +80,10 @@ impl AuditLogger {
     }
 
     fn write_record(&self, record: &AuditRecord<'_>) {
-        if let Ok(json) = serde_json::to_string(record) {
-            if let Ok(mut lock) = self.file.lock() {
-                let _ = writeln!(lock, "{json}");
-            }
+        if let Ok(json) = serde_json::to_string(record)
+            && let Ok(mut lock) = self.file.lock()
+        {
+            let _ = writeln!(lock, "{json}");
         }
     }
 
@@ -80,28 +106,19 @@ impl AuditLogger {
     }
 
     /// Logs a session termination event with traffic volumes and duration.
-    pub fn log_session_close(
-        &self,
-        client: &str,
-        agent: &str,
-        target: &str,
-        session_id: &str,
-        up: u64,
-        down: u64,
-        duration_ms: u128,
-        reason: &str,
-    ) {
+    /// Logs a session termination event with traffic volumes and duration.
+    pub fn log_session_close(&self, session: &SessionRef<'_>, outcome: &SessionOutcome<'_>) {
         self.write_record(&AuditRecord {
             timestamp: Utc::now().to_rfc3339(),
             event: "session_close",
-            client: Some(client),
-            agent: Some(agent),
-            target: Some(target),
-            session_id: Some(session_id),
-            bytes_up: Some(up),
-            bytes_down: Some(down),
-            duration_ms: Some(duration_ms),
-            reason: Some(reason),
+            client: Some(session.client),
+            agent: Some(session.agent),
+            target: Some(session.target),
+            session_id: Some(session.session_id),
+            bytes_up: Some(outcome.bytes_up),
+            bytes_down: Some(outcome.bytes_down),
+            duration_ms: Some(outcome.duration_ms),
+            reason: Some(outcome.reason),
             fingerprint: None,
             action: None,
         });

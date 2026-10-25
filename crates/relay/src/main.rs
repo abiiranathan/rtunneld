@@ -132,6 +132,10 @@ fn parse_ttl(ttl: &str) -> Result<u64> {
         .context("invalid TTL numeric seconds format")
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear startup wiring; splitting would only scatter the sequence"
+)]
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -161,6 +165,7 @@ async fn main() -> Result<()> {
         Command::Serve { state_dir, listen } => {
             let id = load_identity(&state_dir)
                 .context("could not load relay identity; run rtunneld init first")?;
+
             let db = Arc::new(SqliteStore::open(state_dir.join("rtunnel.db"))?);
             let audit = Arc::new(AuditLogger::open(&state_dir)?);
 
@@ -190,9 +195,10 @@ async fn main() -> Result<()> {
                 if !is_valid_name(&name) {
                     bail!("name must match [a-z0-9-]{{1,63}}");
                 }
+
                 let ttl_secs = parse_ttl(&ttl)?;
                 let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-                let expires_at = (now + ttl_secs) as i64;
+                let expires_at = (now + ttl_secs).cast_signed();
 
                 let mut token_bytes = [0u8; 32];
                 rand::thread_rng().fill_bytes(&mut token_bytes);
@@ -269,7 +275,7 @@ async fn main() -> Result<()> {
                 let grants = db.list_grants(client.as_deref())?;
                 println!("{:<20} -> AGENT", "CLIENT");
                 for (c, a) in grants {
-                    println!("{:<20} -> {a}", c);
+                    println!("{c:<20} -> {a}");
                 }
             }
         },

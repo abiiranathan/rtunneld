@@ -1168,6 +1168,7 @@ dependencies = [
  "anyhow",
  "clap",
  "directories",
+ "quinn",
  "rtunnel-identity",
  "rtunnel-proto",
  "rtunnel-transport",
