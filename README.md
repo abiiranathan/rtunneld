@@ -69,8 +69,9 @@ sequenceDiagram
     C->>R: ConnectRequest { target: 482913077 }
     R->>H: OpenTarget { localhost:22 }
     H->>S: TCP connect localhost:22
-    R==>>R: Splice QUIC Streams
-    C<==>>S: End-to-End Encrypted SSH Session
+    Note over R: Splice QUIC streams (ciphertext only)
+    C->>S: End-to-end encrypted SSH session (via relay splice)
+    S-->>C: End-to-end encrypted SSH session (via relay splice)
 ```
 
 ---
