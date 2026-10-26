@@ -1,413 +1,316 @@
 # rtunnel
 
-`rtunnel` provides secure, zero-trust SSH access to servers located on private LANs without opening inbound firewall ports, configuring public NAT routes, or exposing public IPs.
+`rtunnel` provides secure, zero-trust SSH access to machines located on private LANs without opening inbound firewall ports, configuring public NAT routes, or exposing public IPs.
 
+- **AnyDesk-Style Experience**: Connect using a 9-digit Device ID (`482 913 077`) and an ephemeral 6-digit access code with interactive visual verification (SAS).
 - **Mutual TLS with Pinned ed25519 Identities**: No Certificate Authorities, passwords, or DNS-name trust.
 - **End-to-End Encryption**: The relay only splices raw streams; SSH encryption remains strictly end-to-end between client and server.
-- **Strict Default-Deny Authorization**: Client-to-agent access grants on the relay, combined with exact-match target whitelisting on the agent.
+- **Strict Default-Deny Authorization**: Explicit operator approval on the host required before any connection is permitted.
+- **Cross-Platform Host Support**: Runs as a managed service on Linux (`systemd`), macOS (`launchd`), and Windows (`sc.exe`).
 - **Resilient Transport**: Multiplexed QUIC over UDP (`quinn`) with keepalives, dead-peer detection, exponential backoff, and full half-close fidelity.
 
 ---
 
 ## Architecture
 
-rtunnel is a **rendezvous relay**, not a VPN. Both the client and the agent dial
-**outbound** to the relay over QUIC/UDP. The relay authenticates both peers,
-checks the grant, and splices their streams together. The agent is the only
-component that talks to the private target, and SSH encryption remains
-end-to-end between the client's OpenSSH and the target's sshd.
+`rtunnel` is a **rendezvous relay**, not a VPN. Both the connecting workstation and the remote host dial **outbound** to the cloud relay over QUIC/UDP. The relay authenticates both peers, checks the grant, and splices their streams together. The host is the only component that talks to the private target, and SSH encryption remains end-to-end between the client's OpenSSH and the target's sshd.
 
 ```mermaid
 flowchart LR
-    subgraph Client["Workstation / laptop"]
+    subgraph Client["Connecting Workstation"]
         direction TB
         SSH["OpenSSH client"]
-        RC["rtunnel client<br/>(ProxyCommand)"]
+        RC["rtunnel connect 482 913 077"]
         SSH -->|"stdin / stdout"| RC
     end
 
-    subgraph RelayHost["Public relay host"]
+    subgraph RelayHost["Cloud Relay Host (rtunneld)"]
         direction TB
-        Relay["rtunneld<br/>QUIC listener :4433/udp<br/>mTLS + pinned identities"]
-        DB[("SQLite<br/>peers · grants · tokens · targets")]
+        Relay["QUIC listener :4433/udp<br/>mTLS + Device ID Routing"]
+        DB[("SQLite Store<br/>peers · grants · codes")]
         Relay --- DB
     end
 
-    subgraph PrivateLAN["Private LAN (no inbound ports)"]
+    subgraph PrivateLAN["Target Host LAN"]
         direction TB
-        Agent["rtunnel-agent<br/>outbound connector"]
-        Target["Target host<br/>sshd :22"]
-        Agent -->|"TCP to allowed_targets"| Target
+        Host["rtunnel host daemon<br/>Device ID: 482 913 077"]
+        Target["Local sshd :22"]
+        Host -->|"TCP localhost:22"| Target
     end
 
-    User(["ssh user@clinic-a"]) --> SSH
-    RC <-->|"QUIC / UDP 4433<br/>outbound"| Relay
-    Agent <-->|"QUIC / UDP 4433<br/>outbound"| Relay
-    Relay ==>|"splices the two streams<br/>(ciphertext only)"| Agent
+    User(["ssh user@482913077"]) --> SSH
+    RC <-->|"QUIC :4433 outbound"| Relay
+    Host <-->|"QUIC :4433 outbound"| Relay
+    Relay ==>|"splices streams (ciphertext only)"| Host
 ```
 
-### How a Connection Is Made
-
-1. **Enroll.** `rtunneld pair` issues one-time tokens and a grant. The agent and
-   client redeem their tokens and pin the relay's ed25519 fingerprint.
-2. **Register.** The agent dials the relay outbound, authenticates with mTLS,
-   and advertises its `allowed_targets`.
-3. **Connect.** `ssh user@clinic-a` invokes `rtunnel connect clinic-a` as an
-   OpenSSH `ProxyCommand`.
-4. **Authorize.** The relay checks the client-to-agent grant, then asks the
-   agent to open the requested target (or the agent's default target).
-5. **Dial.** The agent opens a TCP connection to the allowlisted `host:port` on
-   the LAN and reports success.
-6. **Splice.** The relay joins the client stream and the agent stream. SSH runs
-   directly between the client and the target; the relay only forwards
-   ciphertext.
+### Pairing and Connection Lifecycle
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant S as OpenSSH client
-    participant C as rtunnel client
-    participant R as rtunneld relay
-    participant A as rtunnel-agent
-    participant T as Target sshd
+    participant C as Connecting Client
+    participant R as Cloud Relay (rtunneld)
+    participant H as Target Host
+    participant S as Local sshd
 
-    Note over A,R: Agent dials out and registers
-    A->>R: QUIC + mTLS, AgentHello
-    R-->>A: HelloAck
-    A->>R: AgentTargets (allowed_targets)
+    Note over H,R: Host dials out, registers Device ID & updates code
+    H->>R: ALPN: rtunnel-rendezvous/1, SetPairingCode(hash)
+    
+    Note over C,R: Client requests pairing with Device ID & Code
+    C->>R: PairRequest { target: 482913077, code: 834291 }
+    R->>R: Verify code hash & enforce attempt limit
+    R->>H: IncomingPairPrompt { SAS, client_id }
+    Note over H: Host operator approves (Allow Once / Always)
+    H-->>R: PairPromptResponse { approved: true, duration: Always }
+    R-->>C: PairResult { success: true }
 
-    Note over S,C: User runs ssh user@clinic-a
-    S->>C: spawn rtunnel connect clinic-a
-    C->>R: ConnectRequest { agent: clinic-a }
-    R->>R: Check client→agent grant
-    R->>A: OpenTarget { session_id, target? }
-    A->>T: TCP connect to allowed target
-    T-->>A: TCP established
-    A-->>R: OpenResult Ok
-    R-->>C: ConnectResponse Ok
-
-    Note over S,T: SSH handshake and data stay end-to-end encrypted
-    C->>R: tunnel bytes
-    R->>A: splice
-    A->>T: TCP bytes
+    Note over C,S: Direct End-to-End SSH
+    C->>R: ConnectRequest { target: 482913077 }
+    R->>H: OpenTarget { localhost:22 }
+    H->>S: TCP connect localhost:22
+    R==>>R: Splice QUIC Streams
+    C<==>>S: End-to-End Encrypted SSH Session
 ```
-
-The relay never sees SSH plaintext, and the target needs no public IP, port
-forward, or inbound firewall rule. Only the relay's UDP port (`4433` by
-default) must be reachable from the client and the agent.
 
 ---
 
 ## Workspace Layout
 
-- `crates/proto`: Frame encoding, Postcard serialization, error codes, and bounds checking.
+- `crates/proto`: Frame encoding, Postcard serialization, error codes, Device ID formatting, and SAS computation.
 - `crates/identity`: ed25519 keys, X.509 SPKI fingerprint extraction, and custom rustls pinning verifiers.
-- `crates/install`: self-installation helpers and systemd unit rendering shared by the binaries.
+- `crates/install`: Cross-platform background service installation (`systemd`, `launchd`, `sc.exe`) and OpenSSH configuration.
 - `crates/transport`: QUIC endpoint builders, 32 KiB copy pumps, rate limiting, and backoff.
-- `crates/relay`: `rtunneld` daemon, SQLite store (WAL mode), access grants, revocation watcher, and audit log.
-- `crates/agent`: `rtunnel-agent` daemon, TCP dialer with `TCP_NODELAY`, and target filtering.
-- `crates/client`: `rtunnel` CLI and OpenSSH `ProxyCommand` bridge (clean stdout piping).
-- `tests`: Multi-peer integration tests covering transfer hash integrity, concurrency, half-close, and revocation.
+- `crates/relay`: `rtunneld` daemon, SQLite store (WAL mode), Device ID allocator, pairing coordinator, and audit log.
+- `crates/agent`: `rtunnel-agent` legacy daemon, TCP dialer with `TCP_NODELAY`, and target filtering.
+- `crates/client`: `rtunnel` unified CLI, interactive host daemon, and OpenSSH `ProxyCommand` bridge.
+- `tests`: Multi-peer integration tests covering Device ID pairing, transfer hash integrity, concurrency, half-close, and revocation.
 
 ---
 
-## Quick Install (Prebuilt Binaries)
+## 1. Deploying the Cloud Relay (`rtunneld`)
 
-Targets need neither a source checkout nor a Rust toolchain. The bootstrapper downloads the requested release, verifies its SHA-256 checksum when available, and runs the binary's built-in `install` command. The hardened systemd units are embedded in the binaries, so nothing from `deploy/` has to be copied to a target. The relay and agent are Linux-only; the client is also available for Windows (see [Windows Client](#windows-client)).
+The rendezvous relay (`rtunneld`) is the single cloud-facing component of the system. It runs on any Linux cloud instance or dedicated server with a publicly accessible IP or domain and an open UDP port (`4433` by default).
 
-### 1. Relay (public host)
+### 1.1 Firewall Prerequisites
+
+Ensure UDP port `4433` is open for inbound traffic:
+
+```bash
+# UFW (Ubuntu/Debian)
+sudo ufw allow 4433/udp
+sudo ufw reload
+
+# Firewalld (RHEL/Fedora/CentOS)
+sudo firewall-cmd --permanent --add-port=4433/udp
+sudo firewall-cmd --reload
+```
+
+### 1.2 Installation Options
+
+#### Option A: One-Line Bootstrap Installer (Recommended)
+The standalone installation script downloads the verified precompiled static binary (`musl`), initializes state in `/var/lib/rtunnel`, generates the relay's ed25519 identity keypair, writes the hardened `systemd` service unit, and starts the daemon immediately:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/abiiranathan/rtunneld/main/scripts/install.sh \
   | sudo bash -s -- relay --listen 0.0.0.0:4433
 ```
 
-The relay is initialized if needed, installed to `/usr/local/bin/rtunneld`, and enabled as `rtunneld.service`. The command prints the relay fingerprint and the exact token commands to run next.
-
-### 2. Pair an Agent and Client (relay host)
-
-One command issues both enrollment tokens and grants the client access:
+#### Option B: Direct Binary Self-Install
+If you downloaded or built the `rtunneld` binary manually:
 
 ```bash
+chmod +x rtunneld
+sudo ./rtunneld install --listen 0.0.0.0:4433
+```
+
+Use `--no-start` to write the unit file without immediately enabling or starting the service.
+
+#### Option C: Docker & Docker Compose
+A production-ready `Dockerfile` and `docker-compose.yml` are provided in `deploy/`:
+
+```bash
+# 1. Initialize relay state and generate keypair
+docker compose -f deploy/docker-compose.yml run --rm relay \
+  /usr/local/bin/rtunneld init --state-dir /var/lib/rtunnel
+
+# 2. Start the relay daemon
+docker compose -f deploy/docker-compose.yml up -d relay
+```
+
+### 1.3 Verifying Relay Health & Audit Log
+
+```bash
+# Check systemd status
+sudo systemctl status rtunneld.service
+
+# View the real-time append-only security audit log
+sudo tail -f /var/lib/rtunnel/audit.log
+```
+
+---
+
+## 2. Quick Start: Connecting Machines (Under 3 Minutes)
+
+Connecting two machines takes three quick steps:
+
+### Step 1: Run Setup (Both Machines)
+
+Run setup once on both the host machine and the connecting workstation:
+
+```bash
+# Linux / macOS
+rtunnel setup --relay-host relay.example.com
+```
+
+```powershell
+# Windows PowerShell
+rtunnel.exe setup --relay-host relay.example.com
+```
+
+Setup generates an ed25519 keypair, connects to the relay, and assigns a persistent 9-digit **Device ID** (e.g. `482 913 077`).
+
+---
+
+### Step 2: Start the Host (Remote LAN Machine)
+
+On the machine you want to access:
+
+```bash
+rtunnel host
+```
+
+It prints your Device ID and a single-use 6-digit access code:
+
+```text
+=== rtunnel Host Daemon Running ===
+Device ID:   482 913 077
+Access Code: 834 291 (valid for 15 minutes)
+Ready for inbound connections. Press Ctrl+C to exit.
+```
+
+*(To run it continuously in the background across reboots, see [Host Service Installation](#3-host-service-installation).)*
+
+---
+
+### Step 3: Connect (Connecting Workstation)
+
+From your laptop or workstation:
+
+```bash
+rtunnel connect 482913077 --code 834291
+```
+
+The host prompts the local operator:
+
+```text
+--------------------------------------------------
+INCOMING PAIRING REQUEST
+Connecting Device: nathan-macbook (914 205 183)
+Authentication Code (SAS): [4192]
+--------------------------------------------------
+Authorize this device? [1] Allow Once, [2] Always Allow, [3] Deny: 2
+```
+
+Both machines display matching 4-digit SAS codes (`4192`) to verify the relay did not tamper with identities. Once approved:
+
+```bash
+ssh user@482913077
+```
+
+Subsequent connections to the same host require no access code or pairing prompt.
+
+---
+
+## 3. Host Service Installation
+
+Run `rtunnel host` as a managed background service so it stays online across reboots:
+
+### Linux (`systemd`)
+```bash
+sudo rtunnel service install
+```
+
+### macOS (`launchd`)
+```bash
+sudo rtunnel service install
+```
+
+### Windows (`Windows Service`)
+Run PowerShell as Administrator:
+```powershell
+rtunnel.exe service install
+```
+
+### Managing the Service
+```bash
+rtunnel service start
+rtunnel service stop
+```
+
+---
+
+## 4. Advanced & Headless Administration
+
+For automated CI/CD pipelines, headless bastion hosts, or air-gapped infrastructure where interactive host-side pairing prompts are impractical, the relay provides an administrative CLI to issue pre-authorized one-time enrollment tokens:
+
+### 4.1 Pairing via Pre-Shared Tokens
+```bash
+# Issue tokens and grant access in one step on the relay host:
 sudo rtunneld pair --agent clinic-a --client laptop \
   --relay-host relay.example.com --relay-port 4433
 ```
 
-It prints the two enrollment URIs and the matching install commands. The
-`--relay-host` value must be the public hostname or IP that peers use to reach
-the relay: `127.0.0.1` only works when the agent and client both run on the relay
-host.
-
-The equivalent manual commands are:
+This prints two enrollment URIs. You then enroll directly:
 
 ```bash
-sudo rtunneld token create --role agent --name clinic-a --ttl 15m \
-  --relay-host relay.example.com --relay-port 4433
-sudo rtunneld token create --role client --name laptop --ttl 15m \
-  --relay-host relay.example.com --relay-port 4433
+# On the agent host:
+sudo rtunnel-agent install "rtunnel://relay.example.com:4433/?fp=<relay_fp>&token=<agent_token>" \
+  --allowed-target 127.0.0.1:22
+
+# On the client workstation:
+rtunnel install "rtunnel://relay.example.com:4433/?fp=<relay_fp>&token=<client_token>"
+```
+
+### 4.2 Manual Token & Grant Commands
+```bash
+# Create individual tokens
+sudo rtunneld token create --role agent --name clinic-a --ttl 15m --relay-host relay.example.com
+sudo rtunneld token create --role client --name laptop --ttl 15m --relay-host relay.example.com
+
+# Authorize or revoke grants
 sudo rtunneld grant add laptop clinic-a
-```
+sudo rtunneld grant remove laptop clinic-a
+sudo rtunneld grant list
 
-### 3. Agent (LAN host)
-
-Use the agent enrollment URI printed by `pair` (or `token create`):
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/abiiranathan/rtunneld/main/scripts/install.sh \
-  | sudo bash -s -- agent "rtunnel://relay.example.com:4433/?fp=<relay_fp>&token=<agent_token>" \
-      --allowed-target 127.0.0.1:22
-```
-
-The agent is installed to `/usr/local/bin/rtunnel-agent`, enrolled, and enabled as `rtunnel-agent.service`.
-
-### 4. Client (dev machine)
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/abiiranathan/rtunneld/main/scripts/install.sh \
-  | bash -s -- client "rtunnel://relay.example.com:4433/?fp=<relay_fp>&token=<client_token>"
-```
-
-The client installer:
-
-- installs `rtunnel` to `~/.local/bin` (or `/usr/local/bin` when run as root),
-- creates `~/.ssh/rtunnel.d` and ensures `~/.ssh/config` contains `Include ~/.ssh/rtunnel.d/*`,
-- enrolls the client when a URI is supplied,
-- discovers every agent granted to this client and writes its SSH host entries
-  automatically (use `--no-ssh-hosts` to skip discovery).
-
-Connect immediately:
-
-```bash
-rtunnel agents          # agents, status, default target, other targets
-ssh user@clinic-a
-```
-
-`rtunnel ssh-config --all --write` regenerates every host entry later, for
-example after an agent adds a target. `rtunnel ssh-config clinic-a` prints the
-same entries to stdout.
-
-### Target Discovery and Names
-
-The agent advertises its `allowed_targets` to the relay, and the relay shares
-them with granted clients. With `allowed_targets = ["winbox:22", "nas:445"]`:
-
-```bash
-$ rtunnel agents
-AGENT                    STATUS   DEFAULT TARGET       OTHER TARGETS
-clinic-a                 online   winbox:22            nas:445
-```
-
-`rtunnel ssh-config --all --write` creates a `Host clinic-a` entry that reaches
-the default target (`winbox:22`), plus short aliases for the remaining targets:
-
-```
-Host clinic-a
-    ProxyCommand rtunnel connect clinic-a
-
-Host winbox
-    ProxyCommand rtunnel connect clinic-a winbox:22
-
-Host nas-445
-    ProxyCommand rtunnel connect clinic-a nas:445
-```
-
-The client never needs to know the target IP, and the aliases come straight
-from the agent's allowlist. None of the target names need to resolve on the
-client: the agent resolves them on the LAN.
-
-Manage the allowlist on the agent host without re-enrolling:
-
-```bash
-sudo rtunnel-agent targets list
-sudo rtunnel-agent targets add winbox:22
-sudo rtunnel-agent targets set winbox:22 nas:445  # first entry is the default
-sudo systemctl restart rtunnel-agent
-```
-
-### Windows Client
-
-The relay and agent are Linux-only. The client runs on Windows 10/11 with the
-bundled Windows OpenSSH client. Run PowerShell as your normal user (no
-administrator prompt is needed):
-
-```powershell
-# Download and run the installer. Pass the enrollment URI printed by
-# `rtunneld token create --role client`.
-$installer = Join-Path $env:TEMP "install-rtunnel.ps1"
-Invoke-WebRequest -UseBasicParsing `
-  https://raw.githubusercontent.com/abiiranathan/rtunneld/main/scripts/install.ps1 `
-  -OutFile $installer
-powershell -ExecutionPolicy Bypass -File $installer `
-  "rtunnel://relay.example.com:4433/?fp=<relay_fp>&token=<client_token>"
-```
-
-The Windows installer:
-
-- installs `rtunnel.exe` to `%LOCALAPPDATA%\Programs\rtunnel`,
-- adds that directory to your user `PATH` (use `-NoPath` to skip),
-- adds an absolute `Include` for `%USERPROFILE%\.ssh\rtunnel.d\*` to
-  `%USERPROFILE%\.ssh\config` (use `-NoSshConfig` to skip),
-- verifies the release SHA-256 checksum when `SHA256SUMS` is available,
-- enrolls the client and writes SSH host entries for every granted agent
-  (use `-NoSshHosts` to skip discovery).
-
-Open a new terminal after installation so the updated `PATH` takes effect, then
-connect by agent name:
-
-```powershell
-rtunnel agents
-ssh user@clinic-a
-```
-
-Regenerate host entries at any time with `rtunnel ssh-config --all --write`.
-
-Use `-Version v0.4.0` to pin a release, `-BinaryPath .\rtunnel.exe` to install a
-binary you already built, and `-DownloadBase <url>` to use a mirror. The
-environment variables used by `install.sh` (`RTUNNEL_VERSION`, `RTUNNEL_REPO`,
-`RTUNNEL_TARGET`, `RTUNNEL_BIN`, `RTUNNEL_BIN_DIR`, `RTUNNEL_DOWNLOAD_BASE`) are
-also honored.
-
-### Pinning a Version or Using a Local Binary
-
-The bootstrapper uses GitHub releases. Override the release or target when needed:
-
-```bash
-# Install a specific release
-sudo RTUNNEL_VERSION=v0.4.0 bash -s -- relay < scripts/install.sh
-
-# Install a binary you already built or downloaded
-sudo RTUNNEL_BIN=/path/to/rtunneld ./scripts/install-relay.sh
-
-# Force a different release asset
-sudo RTUNNEL_TARGET=aarch64-unknown-linux-musl bash -s -- relay < scripts/install.sh
-```
-
-Checkout users can also edit [`scripts/install.conf`](scripts/install.conf). The scripts load it automatically and every value can still be overridden from the environment.
-
-### Direct Binary Usage
-
-Each binary can install itself without any script:
-
-```bash
-sudo ./rtunneld install --listen 0.0.0.0:4433
-sudo ./rtunnel-agent install "rtunnel://relay.example.com:4433/?fp=<relay_fp>&token=<agent_token>" \
-  --allowed-target 127.0.0.1:22
-./rtunnel install "rtunnel://relay.example.com:4433/?fp=<relay_fp>&token=<client_token>"
-```
-
-On Windows, run the client installer directly:
-
-```powershell
-.\rtunnel.exe install "rtunnel://relay.example.com:4433/?fp=<relay_fp>&token=<client_token>"
-```
-
-Use `--no-start` to write the unit without enabling or starting it. Use `--bin-dir` to install the executable somewhere other than the default. Use `--no-path` (client, Windows) to leave the user `PATH` untouched.
-
----
-
-## Deployment with Docker & Docker Compose
-
-A production-ready `Dockerfile` and `docker-compose.yml` are provided in `deploy/`.
-
-### 1. Build the Docker Image
-
-```bash
-docker compose -f deploy/docker-compose.yml build
-```
-
-### 2. Initialize Relay State & Generate Identity
-
-```bash
-docker compose -f deploy/docker-compose.yml run --rm relay \
-  /usr/local/bin/rtunneld init --state-dir /var/lib/rtunnel
-```
-
-### 3. Start the Relay Daemon
-
-```bash
-docker compose -f deploy/docker-compose.yml up -d relay
-```
-
-The relay is now listening on UDP port `4433`.
-
-### 4. Pair the Agent and Client
-
-```bash
-docker compose -f deploy/docker-compose.yml exec relay \
-  /usr/local/bin/rtunneld pair \
-    --agent clinic-a \
-    --client laptop \
-    --relay-host relay.example.com \
-    --relay-port 4433
-```
-
-This creates both enrollment tokens and grants `laptop` access to `clinic-a`.
-Use `token create` plus `grant add` instead if you need separate TTLs or want to
-issue tokens individually.
-
-### 5. Enroll and Run the Agent via Docker
-
-```bash
-# 1. Enroll the agent container
-docker compose -f deploy/docker-compose.yml run --rm agent \
-  /usr/local/bin/rtunnel-agent enroll "rtunnel://relay.example.com:4433/?fp=<relay_fp>&token=<agent_token>" \
-    --allowed-target "sshd-host:22"
-
-# 2. Start the agent daemon
-docker compose -f deploy/docker-compose.yml up -d agent
+# List registered peers or revoke immediately
+sudo rtunneld peers list
+sudo rtunneld revoke clinic-a
 ```
 
 ---
 
-## Native Install from a Checkout
+## 5. Security & Threat Model
 
-If you are building locally, the install scripts use `target/release` when it exists:
-
-```bash
-cargo build --release --workspace
-
-sudo ./scripts/install-relay.sh --listen 0.0.0.0:4433
-sudo ./scripts/install-agent.sh "rtunnel://relay.example.com:4433/?fp=<relay_fp>&token=<agent_token>" \
-  --allowed-target 127.0.0.1:22
-./scripts/install-client.sh "rtunnel://relay.example.com:4433/?fp=<relay_fp>&token=<client_token>"
-```
-
-If no local release binary is present, the scripts download the matching prebuilt release instead of building on the target.
+1. **Short Authentication String (SAS)**: Prevents relay MITM attacks. Even if an untrusted or compromised relay operator substitutes public keys, the 4-digit verification code will mismatch.
+2. **Brute-Force & Enumeration Resistance**: Ephemeral access codes are rate-limited with progressive lockout after 5 incorrect attempts, and codes expire after 15 minutes.
+3. **Zero Plaintext Exposure**: The relay only copies ciphertext frames; SSH keys, passwords, and sessions remain strictly end-to-end encrypted.
+4. **Default-Deny**: A Device ID alone never grants access. First contact requires an explicit operator approval and an active access code.
+5. **Strict File Permissions**: Identity private keys are stored with `0600` modes on Unix, and the daemon refuses to run if keys are world- or group-readable.
 
 ---
 
-## Admin Commands (`rtunneld`)
-
-```bash
-# Issue both tokens and grant access in one command
-rtunneld pair --agent clinic-a --client laptop --relay-host relay.example.com
-
-# List all active peers
-rtunneld peers list
-
-# List authorized access grants
-rtunneld grant list
-
-# Revoke a peer (terminates active sessions within 5 seconds)
-rtunneld revoke clinic-a
-
-# List active enrollment tokens
-rtunneld token list
-```
-
----
-
-## Testing & Quality Assurance
+## 6. Testing & Quality Assurance
 
 Run the test suite:
 
 ```bash
-# Formatting
+# Check formatting
 cargo fmt --check
 
 # Strict pedantic lint checks
 cargo clippy --workspace --all-targets -- -D warnings -W clippy::pedantic
 
-# Cross-crate integration tests (concurrency, data transfer, half-close, revocation)
+# Cross-crate integration tests (Device ID pairing, SAS verification, transfer integrity, half-close, revocation)
 cargo test --workspace --all-targets
 ```
