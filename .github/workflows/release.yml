@@ -1,0 +1,71 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build release binaries
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: cargo build --release --locked --workspace --target ${{ matrix.target }}
+      - name: Package release asset
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/rtunneld" dist/
+          cp "target/${{ matrix.target }}/release/rtunnel-agent" dist/
+          cp "target/${{ matrix.target }}/release/rtunnel" dist/
+          tar -czf "dist/rtunnel-${{ matrix.target }}.tar.gz" \
+            -C dist rtunneld rtunnel-agent rtunnel
+          cd dist
+          sha256sum "rtunnel-${{ matrix.target }}.tar.gz" \
+            > "rtunnel-${{ matrix.target }}.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rtunnel-${{ matrix.target }}
+          path: dist/rtunnel-${{ matrix.target }}.tar.gz*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Combine checksums
+        run: |
+          cd dist
+          cat ./*.sha256 > SHA256SUMS
+          rm -f ./*.sha256
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          generate_release_notes: true

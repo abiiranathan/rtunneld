@@ -5,16 +5,20 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use rand::RngCore;
 use rtunnel_identity::{
-    EnrollmentUri, generate_identity, hex_encode, is_valid_name, load_identity, save_identity,
+    EnrollmentUri, KeyMaterial, generate_identity, hex_encode, is_valid_name, load_identity,
+    save_identity,
 };
 use rtunnel_relay::{AuditLogger, RelayServer, SqliteStore};
 use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
+
+/// Hardened systemd unit embedded at build time so `install` needs no checkout.
+const RELAY_UNIT_TEMPLATE: &str = include_str!("../../../deploy/systemd/rtunneld.service");
 
 #[derive(Parser, Debug)]
 #[command(name = "rtunneld", version, about = "Relay daemon for rtunnel")]
@@ -31,6 +35,18 @@ enum Command {
     Init {
         #[arg(long, default_value = "/var/lib/rtunnel")]
         state_dir: PathBuf,
+    },
+    /// Install this binary and a hardened systemd unit.
+    Install {
+        #[arg(long, default_value = "/usr/local/bin")]
+        bin_dir: PathBuf,
+        #[arg(long, default_value = "/var/lib/rtunnel")]
+        state_dir: PathBuf,
+        #[arg(long, default_value = "0.0.0.0:4433")]
+        listen: SocketAddr,
+        /// Install the unit without enabling or starting the service.
+        #[arg(long)]
+        no_start: bool,
     },
     /// Start the relay daemon service.
     Serve {
@@ -132,6 +148,77 @@ fn parse_ttl(ttl: &str) -> Result<u64> {
         .context("invalid TTL numeric seconds format")
 }
 
+/// Creates the relay identity and SQLite store if they do not exist yet.
+fn initialize_state(state_dir: &Path) -> Result<KeyMaterial> {
+    rtunnel_install::create_private_dir(state_dir)
+        .with_context(|| format!("failed to prepare {}", state_dir.display()))?;
+    let id = generate_identity("relay")?;
+    save_identity(state_dir, &id)?;
+    let _db = SqliteStore::open(state_dir.join("rtunnel.db"))?;
+    Ok(id)
+}
+
+/// Installs the running relay binary, writes its systemd unit, and starts it.
+fn install_relay(
+    bin_dir: &Path,
+    state_dir: &Path,
+    listen: SocketAddr,
+    no_start: bool,
+) -> Result<()> {
+    rtunnel_install::ensure_root()
+        .context("installing the relay service requires root; rerun with sudo")?;
+    rtunnel_install::validate_unit_path(state_dir)?;
+
+    let bin_dir = std::path::absolute(bin_dir).context("invalid binary directory")?;
+    let bin_path = bin_dir.join("rtunneld");
+    rtunnel_install::validate_unit_path(&bin_path)?;
+    let installed = rtunnel_install::install_self(&bin_path)
+        .with_context(|| format!("failed to install {}", bin_path.display()))?;
+
+    rtunnel_install::create_private_dir(state_dir)
+        .with_context(|| format!("failed to prepare {}", state_dir.display()))?;
+
+    let identity = if state_dir.join("identity.key").exists() {
+        load_identity(state_dir).context("failed to load existing relay identity")?
+    } else {
+        initialize_state(state_dir)?
+    };
+
+    let exec_start = format!(
+        "{} serve --state-dir {} --listen {listen}",
+        installed.display(),
+        state_dir.display()
+    );
+    let unit = rtunnel_install::render_unit(RELAY_UNIT_TEMPLATE, &exec_start, state_dir);
+    let unit_path = rtunnel_install::install_unit("rtunneld.service", &unit)
+        .context("failed to install rtunneld.service")?;
+
+    println!("Installed rtunneld at {}", installed.display());
+    println!("Systemd unit: {}", unit_path.display());
+    println!("Relay fingerprint: {}", identity.fingerprint);
+
+    if no_start {
+        println!("Service not started (--no-start).");
+        println!(
+            "Load and start it later with: systemctl daemon-reload && systemctl enable --now rtunneld.service"
+        );
+    } else {
+        rtunnel_install::enable_service("rtunneld.service", true)
+            .context("failed to enable or start rtunneld.service")?;
+        println!("rtunneld.service is enabled and running.");
+    }
+
+    println!();
+    println!("Next steps:");
+    println!("  rtunneld token create --role agent --name <agent-name> --relay-host <public-host>");
+    println!(
+        "  rtunneld token create --role client --name <client-name> --relay-host <public-host>"
+    );
+    println!("  rtunneld grant add <client-name> <agent-name>");
+
+    Ok(())
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "linear startup wiring; splitting would only scatter the sequence"
@@ -154,13 +241,18 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Init { state_dir } => {
-            std::fs::create_dir_all(&state_dir)?;
-            let id = generate_identity("relay")?;
-            save_identity(&state_dir, &id)?;
-            let _db = SqliteStore::open(state_dir.join("rtunnel.db"))?;
+            let id = initialize_state(&state_dir)?;
             println!("Relay initialized.");
             println!("State directory: {}", state_dir.display());
             println!("Relay fingerprint: {}", id.fingerprint);
+        }
+        Command::Install {
+            bin_dir,
+            state_dir,
+            listen,
+            no_start,
+        } => {
+            install_relay(&bin_dir, &state_dir, listen, no_start)?;
         }
         Command::Serve { state_dir, listen } => {
             let id = load_identity(&state_dir)

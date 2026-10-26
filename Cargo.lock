@@ -1143,13 +1143,14 @@ dependencies = [
 
 [[package]]
 name = "rtunnel-agent"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
  "directories",
  "quinn",
  "rtunnel-identity",
+ "rtunnel-install",
  "rtunnel-proto",
  "rtunnel-transport",
  "rustls",
@@ -1163,13 +1164,14 @@ dependencies = [
 
 [[package]]
 name = "rtunnel-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
  "directories",
  "quinn",
  "rtunnel-identity",
+ "rtunnel-install",
  "rtunnel-proto",
  "rtunnel-transport",
  "rustls",
@@ -1183,7 +1185,7 @@ dependencies = [
 
 [[package]]
 name = "rtunnel-identity"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "chrono",
@@ -1200,8 +1202,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rtunnel-install"
+version = "0.2.0"
+dependencies = [
+ "tempfile",
+]
+
+[[package]]
 name = "rtunnel-integration-tests"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "quinn",
  "rand 0.8.8",
@@ -1219,7 +1228,7 @@ dependencies = [
 
 [[package]]
 name = "rtunnel-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "postcard",
@@ -1230,7 +1239,7 @@ dependencies = [
 
 [[package]]
 name = "rtunnel-relay"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1239,6 +1248,7 @@ dependencies = [
  "quinn",
  "rand 0.8.8",
  "rtunnel-identity",
+ "rtunnel-install",
  "rtunnel-proto",
  "rtunnel-transport",
  "rusqlite",
@@ -1254,7 +1264,7 @@ dependencies = [
 
 [[package]]
 name = "rtunnel-transport"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "postcard",

@@ -138,21 +138,21 @@ Document it in `docs/PROTOCOL.md` and implement it in `crates/proto`.
 
 **Relay (`rtunneld`)**
 
-- Subcommands: `init` (create state dir and relay key, print the relay fingerprint), `serve`, `token create|list|revoke`, `grant add|remove|list`, `peers list`, `revoke`.
+- Subcommands: `init` (create state dir and relay key, print the relay fingerprint), `install` (install the running binary, embedded systemd unit, and state), `serve`, `token create|list|revoke`, `grant add|remove|list`, `peers list`, `revoke`.
 - SQLite store (WAL mode) for peers, tokens, and grants, with schema migrations. In-memory registry of online agents (name to connection handle).
 - Enable QUIC address validation (Retry) for unvalidated clients. Authenticate before allocating per-session resources.
 - Handle SIGTERM with graceful shutdown: stop accepting, notify agents, drain sessions for up to 30 s.
 
 **Agent (`rtunnel-agent`)**
 
-- Subcommands: `enroll <uri>`, `run`.
+- Subcommands: `enroll <uri>`, `run`, `install [uri]`.
 - Reconnect loop with exponential backoff: base 1 s, factor 2, cap 60 s, full jitter, reset after a connection has been stable for 60 s.
 - Per stream: validate, dial (with TCP\_NODELAY), splice. Cap concurrent sessions (default 64).
 - Ship a hardened systemd unit (`StateDirectory`, `NoNewPrivileges`, `ProtectSystem=strict`, restricted address families, `Restart=always`).
 
 **Client (`rtunnel`)**
 
-- Subcommands: `enroll <uri>`, `connect <agent> [host:port]`, `agents`, `ssh-config <agent> [host:port]`.
+- Subcommands: `enroll <uri>`, `connect <agent> [host:port]`, `agents`, `ssh-config <agent> [host:port] [--write]`, `install [uri]`.
 - `connect` is the `ProxyCommand` entry point. **stdout carries only tunnel bytes. All logs and errors go to stderr.** On failure, exit non-zero with a one-line, human-readable error. When the stream ends, exit cleanly.
 - `ssh-config` prints a ready-to-paste snippet, for example:
 

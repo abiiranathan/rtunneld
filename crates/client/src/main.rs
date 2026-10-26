@@ -3,12 +3,12 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
-use directories::ProjectDirs;
+use directories::{BaseDirs, ProjectDirs};
 use quinn::Connection;
 use rtunnel_client::ClientConfig;
 use rtunnel_identity::{
-    EnrollmentUri, KeyMaterial, PinnedServerVerifier, generate_identity, load_identity,
-    save_identity,
+    EnrollmentUri, KeyMaterial, PinnedServerVerifier, generate_identity, is_valid_name,
+    load_identity, save_identity,
 };
 use rtunnel_proto::{ALPN_ENROLL, ALPN_TUNNEL, ControlMessage, HostPort, ResultStatus};
 use rtunnel_transport::{
@@ -59,6 +59,21 @@ enum Command {
         agent: String,
         /// Optional destination host:port on the agent LAN (defaults to port 22).
         target: Option<String>,
+        /// Write the snippet to `~/.ssh/rtunnel.d/<agent>.conf` instead of stdout.
+        #[arg(long)]
+        write: bool,
+    },
+    /// Install this binary, configure OpenSSH, and optionally enroll.
+    Install {
+        /// Optional enrollment URI; the client is enrolled after installation.
+        uri: Option<String>,
+        /// Directory to install into. Defaults to `/usr/local/bin` for root and
+        /// `~/.local/bin` for unprivileged users.
+        #[arg(long)]
+        bin_dir: Option<PathBuf>,
+        /// Do not add the rtunnel snippet directory to `~/.ssh/config`.
+        #[arg(long)]
+        no_ssh_config: bool,
     },
 }
 
@@ -119,7 +134,7 @@ async fn dial_relay(
 async fn enroll(state_dir: &Path, uri: &str) -> Result<()> {
     eprintln!("Parsing enrollment URI...");
     let parsed_uri = EnrollmentUri::parse(uri).context("invalid enrollment URI")?;
-    std::fs::create_dir_all(state_dir)
+    rtunnel_install::create_private_dir(state_dir)
         .with_context(|| format!("cannot create state directory {}", state_dir.display()))?;
 
     let id = generate_identity("client")?;
@@ -255,13 +270,97 @@ async fn list_agents(state_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Returns the default installation directory for the client binary.
+fn default_client_bin_dir() -> Result<PathBuf> {
+    if rtunnel_install::is_root() {
+        return Ok(PathBuf::from(rtunnel_install::DEFAULT_BIN_DIR));
+    }
+
+    let dirs = BaseDirs::new().context("cannot determine home directory")?;
+    Ok(dirs.home_dir().join(".local").join("bin"))
+}
+
+/// Installs the running client binary and prepares the user's SSH environment.
+async fn install_client(
+    state_dir: &Path,
+    uri: Option<&str>,
+    bin_dir: Option<PathBuf>,
+    no_ssh_config: bool,
+) -> Result<()> {
+    let bin_dir = match bin_dir {
+        Some(dir) => dir,
+        None => default_client_bin_dir()?,
+    };
+    let bin_path = bin_dir.join("rtunnel");
+    let installed = rtunnel_install::install_self(&bin_path)
+        .with_context(|| format!("failed to install {}", bin_path.display()))?;
+    println!("Installed rtunnel at {}", installed.display());
+
+    if !no_ssh_config {
+        let home = BaseDirs::new()
+            .map(|dirs| dirs.home_dir().to_path_buf())
+            .context("cannot determine home directory")?;
+        let snippets = rtunnel_install::configure_ssh_include(&home)
+            .context("failed to configure the OpenSSH include")?;
+        println!("OpenSSH snippets directory: {}", snippets.display());
+    }
+
+    let installed_dir = installed
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    if let Some(path_var) = std::env::var_os("PATH") {
+        let on_path = std::env::split_paths(&path_var).any(|entry| entry == installed_dir);
+        if !on_path {
+            eprintln!(
+                "warning: {} is not on PATH; add it to your shell profile",
+                installed_dir.display()
+            );
+        }
+    }
+
+    if let Some(uri) = uri {
+        enroll(state_dir, uri).await?;
+    } else {
+        println!("Enroll with: rtunnel enroll \"rtunnel://...\"");
+    }
+    println!("Add an SSH host with: rtunnel ssh-config <agent>");
+
+    Ok(())
+}
+
+/// Builds an OpenSSH `Host` block that proxies through `rtunnel connect`.
+fn ssh_config_snippet(agent: &str, target: Option<&str>) -> String {
+    let target_suffix = target.map_or(String::new(), |dest| format!(" {dest}"));
+    format!("Host {agent}\n    ProxyCommand rtunnel connect {agent}{target_suffix}\n")
+}
+
 /// Prints an OpenSSH `Host` block that proxies through `rtunnel connect`.
 fn print_ssh_config(agent: &str, target: Option<&str>) {
-    println!("Host {agent}");
-    match target {
-        Some(dest) => println!("    ProxyCommand rtunnel connect {agent} {dest}"),
-        None => println!("    ProxyCommand rtunnel connect {agent}"),
+    print!("{}", ssh_config_snippet(agent, target));
+}
+
+/// Writes an OpenSSH snippet into `~/.ssh/rtunnel.d/<agent>.conf`.
+fn write_ssh_config(agent: &str, target: Option<&str>) -> Result<()> {
+    if !is_valid_name(agent) {
+        bail!("agent name must match [a-z0-9-]{{1,63}}");
     }
+    if let Some(dest) = target {
+        HostPort::parse(dest)
+            .map_err(|_| anyhow!("invalid target host:port specification: {dest}"))?;
+    }
+
+    let home = BaseDirs::new()
+        .map(|dirs| dirs.home_dir().to_path_buf())
+        .context("cannot determine home directory")?;
+    let snippets = rtunnel_install::configure_ssh_include(&home)
+        .context("failed to configure the OpenSSH include")?;
+    let path = snippets.join(format!("{agent}.conf"));
+    std::fs::write(&path, ssh_config_snippet(agent, target))
+        .with_context(|| format!("failed to write {}", path.display()))?;
+
+    println!("Wrote {}", path.display());
+    Ok(())
 }
 
 #[tokio::main]
@@ -296,9 +395,22 @@ async fn main() -> Result<()> {
             std::process::exit(code);
         }
         Command::Agents => list_agents(&state_dir).await,
-        Command::SshConfig { agent, target } => {
-            print_ssh_config(&agent, target.as_deref());
+        Command::SshConfig {
+            agent,
+            target,
+            write,
+        } => {
+            if write {
+                write_ssh_config(&agent, target.as_deref())?;
+            } else {
+                print_ssh_config(&agent, target.as_deref());
+            }
             Ok(())
         }
+        Command::Install {
+            uri,
+            bin_dir,
+            no_ssh_config,
+        } => install_client(&state_dir, uri.as_deref(), bin_dir, no_ssh_config).await,
     }
 }

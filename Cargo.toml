@@ -2,6 +2,7 @@
 members = [
   "crates/proto",
   "crates/identity",
+  "crates/install",
   "crates/transport",
   "crates/relay",
   "crates/agent",

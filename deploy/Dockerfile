@@ -4,7 +4,10 @@ WORKDIR /build
 RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 
 COPY Cargo.toml ./
+COPY Cargo.lock ./
 COPY crates ./crates
+COPY deploy ./deploy
+COPY tests ./tests
 
 RUN cargo build --release --workspace
 
