@@ -10,8 +10,8 @@ use quinn::Connection;
 use rand::Rng;
 use rtunnel_client::ClientConfig;
 use rtunnel_identity::{
-    EnrollmentUri, KeyMaterial, PinnedServerVerifier, generate_identity, is_valid_name,
-    load_identity, save_identity,
+    EnrollmentUri, KeyMaterial, PinnedServerVerifier, TofuServerVerifier, generate_identity,
+    is_valid_name, load_identity, save_identity,
 };
 use rtunnel_proto::{
     ALPN_ENROLL, ALPN_RENDEZVOUS, ALPN_TUNNEL, AgentDetail, ControlMessage, ErrorCode,
@@ -58,6 +58,9 @@ enum Command {
         relay_host: String,
         #[arg(long, default_value_t = DEFAULT_RELAY_PORT)]
         relay_port: u16,
+        /// Optional pinned SPKI relay fingerprint. If omitted, Trust On First Use (TOFU) is used.
+        #[arg(long)]
+        relay_fingerprint: Option<String>,
     },
     /// Print local Device ID and active one-time pairing code.
     Id,
@@ -331,7 +334,17 @@ async fn enroll(state_dir: &Path, uri: &str) -> Result<()> {
     Ok(())
 }
 
-async fn run_setup(state_dir: &Path, relay_host: &str, relay_port: u16) -> Result<()> {
+/// .
+///
+/// # Errors
+///
+/// This function will return an error if .
+async fn run_setup(
+    state_dir: &Path,
+    relay_host: &str,
+    relay_port: u16,
+    relay_fingerprint: Option<String>,
+) -> Result<()> {
     println!("=== rtunnel Instant Setup ===");
     rtunnel_install::create_private_dir(state_dir)?;
 
@@ -346,7 +359,11 @@ async fn run_setup(state_dir: &Path, relay_host: &str, relay_port: u16) -> Resul
     println!("Generating your unique 9-digit Device ID...");
 
     let endpoint = create_client_endpoint(BIND_ADDR)?;
-    let verifier = Arc::new(PinnedServerVerifier::new(&id.fingerprint));
+    let observed_fp = Arc::new(std::sync::Mutex::new(None));
+    let verifier = Arc::new(TofuServerVerifier::new_with_optional(
+        relay_fingerprint,
+        Arc::clone(&observed_fp),
+    ));
     let client_config = make_client_config(
         &id.certificate_der,
         &id.private_key_pem,
@@ -355,13 +372,21 @@ async fn run_setup(state_dir: &Path, relay_host: &str, relay_port: u16) -> Resul
     )?;
 
     let relay_addr = lookup_host((relay_host, relay_port))
-        .await?
+        .await
+        .with_context(|| format!("cannot resolve relay address {relay_host}:{relay_port}"))?
         .find(SocketAddr::is_ipv4)
-        .ok_or_else(|| anyhow!("relay host has no IPv4 address"))?;
+        .ok_or_else(|| anyhow!("relay host {relay_host}:{relay_port} has no IPv4 address"))?;
 
     let connection = endpoint
         .connect_with(client_config, relay_addr, relay_host)?
-        .await?;
+        .await
+        .context("relay TLS/QUIC handshake failed")?;
+
+    let captured_relay_fp = observed_fp
+        .lock()
+        .map_err(|_| anyhow!("mutex poisoned"))?
+        .clone()
+        .ok_or_else(|| anyhow!("failed to capture relay certificate fingerprint"))?;
 
     let (mut send, mut recv) = connection.open_bi().await?;
     let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "node".into());
@@ -370,6 +395,7 @@ async fn run_setup(state_dir: &Path, relay_host: &str, relay_port: u16) -> Resul
         existing_device_id: None,
     };
     write_frame(&mut send, &reg_msg).await?;
+    let _ = send.finish();
 
     let device_id = match read_frame(&mut recv).await? {
         ControlMessage::RegisterDeviceAck { device_id } => device_id,
@@ -380,21 +406,24 @@ async fn run_setup(state_dir: &Path, relay_host: &str, relay_port: u16) -> Resul
     let config = ClientConfig {
         relay_host: relay_host.to_string(),
         relay_port,
-        relay_fingerprint: id.fingerprint.clone(),
+        relay_fingerprint: captured_relay_fp.clone(),
         client_name: device_id.clone(),
     };
     config.save(state_dir)?;
 
     // Configure SSH include
-    let home = BaseDirs::new()
-        .map(|dirs| dirs.home_dir().to_path_buf())
-        .context("cannot determine home directory")?;
-    let _ = rtunnel_install::configure_ssh_include(&home);
+    if let Some(dirs) = BaseDirs::new() {
+        let _ = rtunnel_install::configure_ssh_include(dirs.home_dir());
+    }
 
     println!();
     println!("Setup Complete!");
     println!("--------------------------------------------------");
-    println!("Your Device ID:   {}", format_device_id(&device_id));
+    println!(
+        "Your Device ID:            {}",
+        format_device_id(&device_id)
+    );
+    println!("Pinned Relay Fingerprint:  {captured_relay_fp}");
     println!("--------------------------------------------------");
     println!("To allow remote access to this machine:");
     println!("  rtunnel host");
@@ -751,8 +780,9 @@ async fn main() -> Result<()> {
         Command::Setup {
             relay_host,
             relay_port,
+            relay_fingerprint,
         } => {
-            run_setup(&state_dir, &relay_host, relay_port).await?;
+            run_setup(&state_dir, &relay_host, relay_port, relay_fingerprint).await?;
         }
         Command::Id => {
             let (config, _) = load_client_state(&state_dir)?;

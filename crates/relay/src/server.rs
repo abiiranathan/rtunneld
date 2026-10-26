@@ -481,6 +481,7 @@ impl RelayServer {
                 info!(device_id = %device_id, label = %label, "allocated device id");
                 let resp = ControlMessage::RegisterDeviceAck { device_id };
                 write_logged(send, &resp, "RegisterDeviceAck").await;
+                finish_logged(send, "RegisterDeviceAck");
             }
             Err(e) => {
                 send_error(send, ErrorCode::Internal, e.to_string()).await;

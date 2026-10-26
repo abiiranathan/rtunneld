@@ -16,7 +16,7 @@ use std::path::Path;
 use thiserror::Error;
 
 pub use spki::extract_spki;
-pub use verifier::{PeerValidator, PinnedClientVerifier, PinnedServerVerifier};
+pub use verifier::{PeerValidator, PinnedClientVerifier, PinnedServerVerifier, TofuServerVerifier};
 
 /// Errors encountered in identity generation, verification, or serialization.
 #[derive(Debug, Error)]
