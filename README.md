@@ -9,6 +9,95 @@
 
 ---
 
+## Architecture
+
+rtunnel is a **rendezvous relay**, not a VPN. Both the client and the agent dial
+**outbound** to the relay over QUIC/UDP. The relay authenticates both peers,
+checks the grant, and splices their streams together. The agent is the only
+component that talks to the private target, and SSH encryption remains
+end-to-end between the client's OpenSSH and the target's sshd.
+
+```mermaid
+flowchart LR
+    subgraph Client["Workstation / laptop"]
+        direction TB
+        SSH["OpenSSH client"]
+        RC["rtunnel client<br/>(ProxyCommand)"]
+        SSH -->|"stdin / stdout"| RC
+    end
+
+    subgraph RelayHost["Public relay host"]
+        direction TB
+        Relay["rtunneld<br/>QUIC listener :4433/udp<br/>mTLS + pinned identities"]
+        DB[("SQLite<br/>peers · grants · tokens · targets")]
+        Relay --- DB
+    end
+
+    subgraph PrivateLAN["Private LAN (no inbound ports)"]
+        direction TB
+        Agent["rtunnel-agent<br/>outbound connector"]
+        Target["Target host<br/>sshd :22"]
+        Agent -->|"TCP to allowed_targets"| Target
+    end
+
+    User(["ssh user@clinic-a"]) --> SSH
+    RC <-->|"QUIC / UDP 4433<br/>outbound"| Relay
+    Agent <-->|"QUIC / UDP 4433<br/>outbound"| Relay
+    Relay ==>|"splices the two streams<br/>(ciphertext only)"| Agent
+```
+
+### How a Connection Is Made
+
+1. **Enroll.** `rtunneld pair` issues one-time tokens and a grant. The agent and
+   client redeem their tokens and pin the relay's ed25519 fingerprint.
+2. **Register.** The agent dials the relay outbound, authenticates with mTLS,
+   and advertises its `allowed_targets`.
+3. **Connect.** `ssh user@clinic-a` invokes `rtunnel connect clinic-a` as an
+   OpenSSH `ProxyCommand`.
+4. **Authorize.** The relay checks the client-to-agent grant, then asks the
+   agent to open the requested target (or the agent's default target).
+5. **Dial.** The agent opens a TCP connection to the allowlisted `host:port` on
+   the LAN and reports success.
+6. **Splice.** The relay joins the client stream and the agent stream. SSH runs
+   directly between the client and the target; the relay only forwards
+   ciphertext.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant S as OpenSSH client
+    participant C as rtunnel client
+    participant R as rtunneld relay
+    participant A as rtunnel-agent
+    participant T as Target sshd
+
+    Note over A,R: Agent dials out and registers
+    A->>R: QUIC + mTLS, AgentHello
+    R-->>A: HelloAck
+    A->>R: AgentTargets (allowed_targets)
+
+    Note over S,C: User runs ssh user@clinic-a
+    S->>C: spawn rtunnel connect clinic-a
+    C->>R: ConnectRequest { agent: clinic-a }
+    R->>R: Check client→agent grant
+    R->>A: OpenTarget { session_id, target? }
+    A->>T: TCP connect to allowed target
+    T-->>A: TCP established
+    A-->>R: OpenResult Ok
+    R-->>C: ConnectResponse Ok
+
+    Note over S,T: SSH handshake and data stay end-to-end encrypted
+    C->>R: tunnel bytes
+    R->>A: splice
+    A->>T: TCP bytes
+```
+
+The relay never sees SSH plaintext, and the target needs no public IP, port
+forward, or inbound firewall rule. Only the relay's UDP port (`4433` by
+default) must be reachable from the client and the agent.
+
+---
+
 ## Workspace Layout
 
 - `crates/proto`: Frame encoding, Postcard serialization, error codes, and bounds checking.
