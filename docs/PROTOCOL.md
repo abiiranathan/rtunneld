@@ -24,6 +24,24 @@ Every control message begins with a 2-byte big-endian length prefix followed by 
 - `Shutdown { reason }`
 - `Revoked { reason }`
 - `Error { code: ErrorCode, message }`
+- `AgentTargets { targets: Vec<String> }`
+- `ListAgentsDetailed { client_name }`
+- `AgentsDetailedResponse { agents: Vec<AgentDetail> }`
+
+## 2.1 Target Discovery (Protocol Minor 2)
+`AgentTargets` is sent by an agent on a **dedicated bidirectional stream**
+immediately after the `HelloAck` control handshake. The control stream is not
+reused, so relays that predate discovery simply ignore the unaccepted stream.
+A discovery-aware relay records the list, persists it in `agent_targets`, and
+includes it in `AgentsDetailedResponse`.
+
+Clients ask with `ListAgentsDetailed`. If the relay rejects the frame (revision 1
+relay), the client retries with `ListAgents` on a new stream and receives an
+empty target list. `ListAgentsResponse` and `AgentInfo` are unchanged, so old
+clients continue to work against new relays.
+
+The first target in the advertised list is the agent's default for target-less
+`ConnectRequest`s.
 
 ## 3. Stream Splicing & Teardown
 When an `OpenResult::Ok` is delivered, the control stream transitions into a transparent bidirectional byte pipe:

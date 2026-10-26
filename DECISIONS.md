@@ -1,5 +1,14 @@
 # Decisions and Assumptions Log
 
+## 2026-10-26 — Agent Target Discovery and One-Step Onboarding
+- **Separate Advertisement Stream**: Agents send `AgentTargets` on a dedicated bidirectional stream after `HelloAck` instead of extending `AgentHello`. Postcard is not self-describing, so appending a field to an enum variant would break old readers. An unaccepted stream is harmless to revision 1 relays, which makes rolling upgrades safe in both directions.
+- **Parallel Query Message**: Target-aware clients use `ListAgentsDetailed`/`AgentsDetailedResponse`. If a revision 1 relay rejects the unknown frame, the client falls back to `ListAgents` and reports empty targets. `AgentInfo` and `ListAgentsResponse` are untouched so old clients still decode new relay responses.
+- **Persisted Targets**: The relay stores the last advertised list in an `agent_targets` table. `rtunnel agents` can therefore show targets for an offline agent, and `rtunnel ssh-config --all --write` works before the agent reconnects.
+- **Generated Host Names**: The target-less `Host <agent>` entry uses the agent's default (first) target. Additional targets get deterministic aliases derived from `host` and, for non-standard ports, `host-port`. Aliases never shadow the agent name; collisions are prefixed with the agent name and numbered.
+- **Automatic Onboarding**: `rtunnel install <uri>` enrolls and immediately writes host entries for every granted agent. `--no-ssh-hosts` opts out. The same work is available on demand through `rtunnel ssh-config --all --write`.
+- **Pairing Command**: `rtunneld pair --agent <name> --client <name> --relay-host <host>` issues both tokens and the grant atomically, replacing the three manual admin commands. `token create` now requires an explicit `--relay-host` because defaulting to `127.0.0.1` produced unusable enrollment URIs on remote agents.
+- **Runtime Allowlist Management**: `rtunnel-agent targets list|add|remove|set` edits the existing config without re-enrollment. The first entry remains the default target; the command prints the restart step.
+
 ## 2026-10-26 — Native Windows Client
 - **Scope**: Windows support covers the `rtunnel` client only. The relay and agent remain Linux-only because their installation and supervision model is systemd-based.
 - **Platform Naming and Paths**: `rtunnel_install::executable_name` appends `.exe` on Windows, and the client installs to `%LOCALAPPDATA%\Programs\rtunnel` instead of `~/.local/bin`.

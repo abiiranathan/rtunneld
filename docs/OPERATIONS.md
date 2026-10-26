@@ -21,7 +21,26 @@ Useful options:
 - `--bin-dir <dir>` installs the executable somewhere other than `/usr/local/bin` (relay/agent), `~/.local/bin` (Unix client), or `%LOCALAPPDATA%\Programs\rtunnel` (Windows client).
 - `--no-start` writes the unit without enabling or starting the service.
 - `--no-ssh-config` (client only) skips the `~/.ssh/config` include.
+- `--no-ssh-hosts` (client only) skips automatic host discovery after enrollment.
 - `--no-path` (Windows client only) skips adding the install directory to the user `PATH`.
+
+After enrolling, the client queries the relay and writes an OpenSSH entry for
+every granted agent. The agent block routes to the agent's default target (the
+first `allowed_targets` entry); extra targets get short aliases such as
+`Host winbox` or `Host nas-445`. Regenerate the entries at any time:
+
+```bash
+rtunnel ssh-config --all --write
+```
+
+Change an agent's allowlist without re-enrolling it:
+
+```bash
+sudo rtunnel-agent targets list
+sudo rtunnel-agent targets add winbox:22
+sudo rtunnel-agent targets set winbox:22 nas:445
+sudo systemctl restart rtunnel-agent
+```
 
 The scripts in `scripts/` are standalone bootstrappers around these commands. They download a prebuilt release, verify its checksum when `SHA256SUMS` is available, and then invoke the matching `install` subcommand. `scripts/install.conf` provides repo, version, state directory, listen address, and binary directory defaults; every value can be overridden by environment variables.
 
@@ -58,7 +77,7 @@ The Windows client requires the optional OpenSSH Client feature (Settings > Apps
 ```powershell
 ssh -V
 rtunnel.exe agents
-rtunnel.exe ssh-config <agent> --write
+rtunnel.exe ssh-config --all --write
 ssh user@<agent>
 ```
 
@@ -67,7 +86,8 @@ ssh user@<agent>
 - Agent State: `/var/lib/rtunnel-agent` (`identity.key`, `identity.crt`, `config.toml`)
 - Client State (Unix): `~/.config/rtunnel` (`identity.key`, `identity.crt`, `config.toml`)
 - Client State (Windows): `%APPDATA%\rtunnel` (`identity.key`, `identity.crt`, `config.toml`)
-- Client SSH snippets: `~/.ssh/rtunnel.d/*.conf`, loaded from `~/.ssh/config` by `rtunnel install` or `rtunnel ssh-config --write`; on Windows the same files live under `%USERPROFILE%\.ssh\rtunnel.d\`
+- Client SSH snippets: `~/.ssh/rtunnel.d/*.conf`, loaded from `~/.ssh/config` by `rtunnel install`, `rtunnel ssh-config --write`, or `rtunnel ssh-config --all --write`; on Windows the same files live under `%USERPROFILE%\.ssh\rtunnel.d\`
+- Relay agent targets: `agent_targets` table in `rtunnel.db` stores the last targets advertised by each agent, so `rtunnel agents` can describe an agent while it is offline.
 
 ## Audit Logging
 The relay produces an append-only JSONL log at `<state_dir>/audit.log` recording:

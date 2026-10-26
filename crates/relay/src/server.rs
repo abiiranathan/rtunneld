@@ -8,7 +8,8 @@ use crate::store::{PeerRecord, SqliteStore};
 use quinn::{Connection, Endpoint, Incoming, RecvStream, SendStream, VarInt};
 use rtunnel_identity::{KeyMaterial, PinnedClientVerifier, hex_encode};
 use rtunnel_proto::{
-    ALPN_ENROLL, ALPN_TUNNEL, AgentInfo, ControlMessage, ErrorCode, HostPort, ResultStatus,
+    ALPN_ENROLL, ALPN_TUNNEL, AgentDetail, AgentInfo, ControlMessage, ErrorCode, HostPort,
+    ResultStatus,
 };
 use rtunnel_transport::{
     RateLimiter, create_server_endpoint, extract_alpn, extract_peer_fingerprint,
@@ -28,6 +29,8 @@ const REVOCATION_POLL_INTERVAL: Duration = Duration::from_secs(1);
 struct AgentSession {
     connection: Connection,
     fingerprint: String,
+    /// Most recent targets advertised by this agent connection.
+    targets: Vec<String>,
     _ctrl_send: SendStream,
 }
 
@@ -323,6 +326,7 @@ impl RelayServer {
         let session = AgentSession {
             connection: connection.clone(),
             fingerprint: peer.fingerprint.clone(),
+            targets: Vec::new(),
             _ctrl_send: ctrl_send,
         };
         // `insert` hands back any previous session for this agent name, which
@@ -339,6 +343,7 @@ impl RelayServer {
 
         let agents = Arc::clone(&self.agents);
         let agent_name = peer.name.clone();
+        let control_connection_id = connection.stable_id();
         tokio::spawn(async move {
             // Resolves when the agent closes or drops its control stream.
             let _ = read_frame(&mut ctrl_recv).await;
@@ -346,9 +351,38 @@ impl RelayServer {
             // Deregister only if a newer connection has not already replaced this one.
             if lock
                 .get(&agent_name)
-                .is_some_and(|s| s.connection.stable_id() == connection.stable_id())
+                .is_some_and(|s| s.connection.stable_id() == control_connection_id)
             {
                 lock.remove(&agent_name);
+            }
+        });
+
+        // Target advertisements arrive on their own streams. Relays that predate
+        // discovery never accept these streams, so an agent can send them safely.
+        let agents = Arc::clone(&self.agents);
+        let store = Arc::clone(&self.store);
+        let agent_name = peer.name.clone();
+        tokio::spawn(async move {
+            while let Ok((mut send, mut recv)) = connection.accept_bi().await {
+                let Ok(ControlMessage::AgentTargets { targets }) = read_frame(&mut recv).await
+                else {
+                    continue;
+                };
+                // Targets are display and discovery metadata. Drop anything that
+                // is not a well-formed host:port so clients never see junk.
+                let targets: Vec<String> = targets
+                    .into_iter()
+                    .filter(|target| HostPort::parse(target).is_ok())
+                    .collect();
+
+                info!(agent = %agent_name, targets = ?targets, "agent advertised targets");
+                if let Err(e) = store.set_agent_targets(&agent_name, &targets) {
+                    warn!(agent = %agent_name, error = %e, "cannot persist advertised targets");
+                }
+                if let Some(session) = agents.write().await.get_mut(&agent_name) {
+                    session.targets = targets;
+                }
+                let _ = send.finish();
             }
         });
     }
@@ -402,6 +436,56 @@ impl RelayServer {
                     .collect();
                 let resp = ControlMessage::ListAgentsResponse { agents };
                 // Best effort: the client may already have disconnected.
+                let _ = write_frame(&mut client_send, &resp).await;
+            }
+            ControlMessage::ListAgentsDetailed { .. } => {
+                let grants = self
+                    .store
+                    .list_grants(Some(client_name))
+                    .unwrap_or_else(|e| {
+                        warn!(client = %client_name, error = %e, "grant lookup failed");
+                        Vec::new()
+                    });
+
+                // Snapshot the live registry without touching the store, so the
+                // read lock is never held across a database call.
+                let live: HashMap<String, (bool, Vec<String>)> = {
+                    let lock = self.agents.read().await;
+                    grants
+                        .iter()
+                        .map(|(_, agent)| {
+                            let session = lock.get(agent);
+                            (
+                                agent.clone(),
+                                (
+                                    session.is_some(),
+                                    session.map_or_else(Vec::new, |s| s.targets.clone()),
+                                ),
+                            )
+                        })
+                        .collect()
+                };
+
+                let agents: Vec<AgentDetail> = grants
+                    .into_iter()
+                    .map(|(_, agent)| {
+                        let (online, advertised) = live.get(&agent).cloned().unwrap_or_default();
+                        // Fall back to the last advertisement so an offline agent
+                        // still shows what it can reach.
+                        let targets = if advertised.is_empty() {
+                            self.store.get_agent_targets(&agent).unwrap_or_default()
+                        } else {
+                            advertised
+                        };
+                        AgentDetail {
+                            name: agent,
+                            online,
+                            targets,
+                        }
+                    })
+                    .collect();
+
+                let resp = ControlMessage::AgentsDetailedResponse { agents };
                 let _ = write_frame(&mut client_send, &resp).await;
             }
             ControlMessage::ConnectRequest { agent, target } => {

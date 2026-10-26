@@ -15,7 +15,7 @@
     Optional one-time enrollment URI printed by `rtunneld token create`.
 
 .PARAMETER Version
-    Release tag to install, for example `v0.2.0`. Defaults to the latest release.
+    Release tag to install, for example `v0.4.0`. Defaults to the latest release.
 
 .PARAMETER Target
     Override the release asset target triple. Defaults to the host architecture.
@@ -40,6 +40,9 @@
 .PARAMETER NoSshConfig
     Do not add the rtunnel snippet include to `%USERPROFILE%\.ssh\config`.
 
+.PARAMETER NoSshHosts
+    Do not create OpenSSH host entries for granted agents after enrolling.
+
 .PARAMETER SkipChecksum
     Install even when the release checksum is missing or cannot be fetched.
 
@@ -48,7 +51,7 @@
         "rtunnel://relay.example.com:4433/?fp=<relay_fp>&token=<client_token>"
 
 .EXAMPLE
-    .\install.ps1 -Version v0.2.0 -BinDir "$env:LOCALAPPDATA\Programs\rtunnel"
+    .\install.ps1 -Version v0.4.0 -BinDir "$env:LOCALAPPDATA\Programs\rtunnel"
 #>
 [CmdletBinding()]
 param(
@@ -63,6 +66,7 @@ param(
     [string]$Repo = 'abiiranathan/rtunneld',
     [switch]$NoPath,
     [switch]$NoSshConfig,
+    [switch]$NoSshHosts,
     [switch]$SkipChecksum
 )
 
@@ -303,6 +307,9 @@ try {
     if ($NoSshConfig) {
         $installArguments += '--no-ssh-config'
     }
+    if ($NoSshHosts) {
+        $installArguments += '--no-ssh-hosts'
+    }
     if ($NoPath) {
         $installArguments += '--no-path'
     }
@@ -324,7 +331,7 @@ try {
     Write-Log 'Windows client installation complete.'
     Write-Host 'Open a new terminal so PATH changes take effect, then run:'
     Write-Host '  rtunnel agents'
-    Write-Host '  rtunnel ssh-config <agent> --write'
+    Write-Host '  rtunnel ssh-config --all --write'
     Write-Host '  ssh user@<agent>'
 }
 finally {

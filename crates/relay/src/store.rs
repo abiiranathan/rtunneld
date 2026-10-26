@@ -89,6 +89,18 @@ impl SqliteStore {
             (),
         )?;
 
+        // Last targets advertised by each agent. Kept separately from `peers`
+        // so enrollment never has to know about target discovery, and so the
+        // relay can still describe an agent while it is offline.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS agent_targets (
+                agent_name TEXT PRIMARY KEY,
+                targets TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            )",
+            (),
+        )?;
+
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -182,6 +194,50 @@ impl SqliteStore {
             })
         })?;
         rows.collect()
+    }
+
+    /// Records the targets most recently advertised by an agent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`rusqlite::Error`] when the target list cannot be serialized
+    /// or the statement fails.
+    pub fn set_agent_targets(&self, agent_name: &str, targets: &[String]) -> SqliteResult<()> {
+        let encoded = serde_json::to_string(targets)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        let lock = self.conn.lock().expect("lock acquired");
+        lock.execute(
+            "INSERT INTO agent_targets (agent_name, targets, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(agent_name) DO UPDATE SET
+                targets = excluded.targets,
+                updated_at = excluded.updated_at",
+            params![agent_name, encoded, current_epoch_seconds()],
+        )?;
+        Ok(())
+    }
+
+    /// Returns the last targets advertised by an agent, or an empty list.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`rusqlite::Error`] on query failure or when the stored JSON is
+    /// not a string array.
+    pub fn get_agent_targets(&self, agent_name: &str) -> SqliteResult<Vec<String>> {
+        let lock = self.conn.lock().expect("lock acquired");
+        let encoded: Option<String> = lock
+            .query_row(
+                "SELECT targets FROM agent_targets WHERE agent_name = ?1",
+                [agent_name],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(encoded) = encoded else {
+            return Ok(Vec::new());
+        };
+        serde_json::from_str(&encoded).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })
     }
 
     /// Revokes a peer by name or fingerprint.

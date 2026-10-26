@@ -139,6 +139,10 @@ impl AgentRunner {
             _ => return Err("unexpected response to AgentHello".into()),
         }
 
+        // Advertise the allowlist on a separate stream. Old relays do not accept
+        // extra streams and simply ignore it, so this stays backward compatible.
+        advertise_targets(connection, &self.config.allowed_targets).await;
+
         // Keep ctrl_send alive inside ctrl_monitor so the stream is not closed prematurely
         let ctrl_monitor = async {
             let _keep_alive = ctrl_send;
@@ -165,6 +169,32 @@ impl AgentRunner {
             res = ctrl_monitor => res,
             res = stream_acceptor => res,
         }
+    }
+}
+
+/// Sends the agent's allowed targets to the relay so clients can discover them.
+///
+/// The advertisement is best effort: a relay that predates target discovery
+/// never accepts the stream, and the agent continues serving sessions either way.
+async fn advertise_targets(connection: &Connection, targets: &[String]) {
+    let advertisement = async {
+        let (mut send, _recv) = connection.open_bi().await.map_err(|e| e.to_string())?;
+        write_frame(
+            &mut send,
+            &ControlMessage::AgentTargets {
+                targets: targets.to_vec(),
+            },
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        send.finish().map_err(|e| e.to_string())?;
+        Ok::<(), String>(())
+    };
+
+    match tokio::time::timeout(Duration::from_secs(5), advertisement).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!(error = %e, "cannot advertise targets to relay"),
+        Err(_) => warn!("timed out while advertising targets to relay"),
     }
 }
 

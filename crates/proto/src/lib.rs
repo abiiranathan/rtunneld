@@ -20,7 +20,10 @@ pub const ALPN_TUNNEL: &[u8] = b"rtunnel/1";
 pub const ALPN_ENROLL: &[u8] = b"rtunnel-enroll/1";
 
 /// Current protocol minor revision.
-pub const PROTOCOL_MINOR: u16 = 1;
+///
+/// Revision 2 adds agent target discovery while keeping the revision 1 control
+/// messages decodable in both directions.
+pub const PROTOCOL_MINOR: u16 = 2;
 
 /// Stable protocol error codes exchanged between relay, agent, and client peers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,6 +147,20 @@ pub struct AgentInfo {
     pub online: bool,
 }
 
+/// Agent status including the targets the agent has advertised.
+///
+/// This is a separate type from [`AgentInfo`] so that older clients can keep
+/// decoding [`ControlMessage::ListAgentsResponse`] unchanged.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentDetail {
+    /// The unique name of the agent.
+    pub name: String,
+    /// Whether the agent currently holds an active connection to the relay.
+    pub online: bool,
+    /// Exact-match `host:port` targets the agent accepts.
+    pub targets: Vec<String>,
+}
+
 /// Control messages exchanged over QUIC bidirectional streams.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlMessage {
@@ -238,6 +255,25 @@ pub enum ControlMessage {
         code: ErrorCode,
         /// Human-readable error message.
         message: String,
+    },
+    /// Agent advertisement of the targets it is willing to open.
+    ///
+    /// Sent on a dedicated bidirectional stream immediately after the control
+    /// handshake. Relays that predate this message simply ignore the unhandled
+    /// stream, so the advertisement is backward compatible.
+    AgentTargets {
+        /// Exact-match `host:port` targets accepted by the agent.
+        targets: Vec<String>,
+    },
+    /// Client query for agents including their advertised targets.
+    ListAgentsDetailed {
+        /// Authenticated client name.
+        client_name: String,
+    },
+    /// Relay response carrying agent targets for clients that support discovery.
+    AgentsDetailedResponse {
+        /// Granted agent statuses with advertised targets.
+        agents: Vec<AgentDetail>,
     },
 }
 
@@ -355,7 +391,51 @@ mod tests {
             "[a-z0-9-]{1,16}".prop_map(|token| ControlMessage::Enroll { token }),
             ("[a-z0-9-]{1,16}", "[a-z0-9-]{1,16}")
                 .prop_map(|(name, role)| ControlMessage::EnrollAck { name, role }),
+            prop::collection::vec("[a-z0-9.-]{1,16}:[0-9]{1,5}", 0..=4)
+                .prop_map(|targets| ControlMessage::AgentTargets { targets }),
+            "[a-z0-9-]{1,16}"
+                .prop_map(|client_name| ControlMessage::ListAgentsDetailed { client_name }),
+            (
+                "[a-z0-9-]{1,16}",
+                any::<bool>(),
+                prop::collection::vec("[a-z0-9.-]{1,16}:[0-9]{1,5}", 0..=4)
+            )
+                .prop_map(|(name, online, targets)| {
+                    ControlMessage::AgentsDetailedResponse {
+                        agents: vec![AgentDetail {
+                            name,
+                            online,
+                            targets,
+                        }],
+                    }
+                }),
         ]
+    }
+
+    #[test]
+    fn round_trip_agent_targets() {
+        let msg = ControlMessage::AgentTargets {
+            targets: vec!["winbox:22".into(), "nas:445".into()],
+        };
+        let encoded = encode_frame(&msg).unwrap();
+        let (decoded, consumed) = decode_frame(&encoded).unwrap();
+        assert_eq!(decoded, msg);
+        assert_eq!(consumed, encoded.len());
+    }
+
+    #[test]
+    fn round_trip_agents_detailed_response() {
+        let msg = ControlMessage::AgentsDetailedResponse {
+            agents: vec![AgentDetail {
+                name: "clinic-a".into(),
+                online: true,
+                targets: vec!["winbox:22".into()],
+            }],
+        };
+        let encoded = encode_frame(&msg).unwrap();
+        let (decoded, consumed) = decode_frame(&encoded).unwrap();
+        assert_eq!(decoded, msg);
+        assert_eq!(consumed, encoded.len());
     }
 
     #[test]

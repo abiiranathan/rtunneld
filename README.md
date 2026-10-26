@@ -35,24 +35,33 @@ curl -fsSL https://raw.githubusercontent.com/abiiranathan/rtunneld/main/scripts/
 
 The relay is initialized if needed, installed to `/usr/local/bin/rtunneld`, and enabled as `rtunneld.service`. The command prints the relay fingerprint and the exact token commands to run next.
 
-### 2. Issue Tokens and Grants (relay host)
+### 2. Pair an Agent and Client (relay host)
+
+One command issues both enrollment tokens and grants the client access:
 
 ```bash
-# Create an agent token
+sudo rtunneld pair --agent clinic-a --client laptop \
+  --relay-host relay.example.com --relay-port 4433
+```
+
+It prints the two enrollment URIs and the matching install commands. The
+`--relay-host` value must be the public hostname or IP that peers use to reach
+the relay: `127.0.0.1` only works when the agent and client both run on the relay
+host.
+
+The equivalent manual commands are:
+
+```bash
 sudo rtunneld token create --role agent --name clinic-a --ttl 15m \
   --relay-host relay.example.com --relay-port 4433
-
-# Create a client token
 sudo rtunneld token create --role client --name laptop --ttl 15m \
   --relay-host relay.example.com --relay-port 4433
-
-# Authorize laptop to connect to clinic-a
 sudo rtunneld grant add laptop clinic-a
 ```
 
 ### 3. Agent (LAN host)
 
-Use the enrollment URI printed by `token create`:
+Use the agent enrollment URI printed by `pair` (or `token create`):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/abiiranathan/rtunneld/main/scripts/install.sh \
@@ -73,16 +82,58 @@ The client installer:
 
 - installs `rtunnel` to `~/.local/bin` (or `/usr/local/bin` when run as root),
 - creates `~/.ssh/rtunnel.d` and ensures `~/.ssh/config` contains `Include ~/.ssh/rtunnel.d/*`,
-- enrolls the client when a URI is supplied.
+- enrolls the client when a URI is supplied,
+- discovers every agent granted to this client and writes its SSH host entries
+  automatically (use `--no-ssh-hosts` to skip discovery).
 
-Generate the SSH host entry and connect:
+Connect immediately:
 
 ```bash
-rtunnel ssh-config clinic-a --write
+rtunnel agents          # agents, status, default target, other targets
 ssh user@clinic-a
 ```
 
-`rtunnel ssh-config clinic-a` prints the same snippet if you prefer to place it manually.
+`rtunnel ssh-config --all --write` regenerates every host entry later, for
+example after an agent adds a target. `rtunnel ssh-config clinic-a` prints the
+same entries to stdout.
+
+### Target Discovery and Names
+
+The agent advertises its `allowed_targets` to the relay, and the relay shares
+them with granted clients. With `allowed_targets = ["winbox:22", "nas:445"]`:
+
+```bash
+$ rtunnel agents
+AGENT                    STATUS   DEFAULT TARGET       OTHER TARGETS
+clinic-a                 online   winbox:22            nas:445
+```
+
+`rtunnel ssh-config --all --write` creates a `Host clinic-a` entry that reaches
+the default target (`winbox:22`), plus short aliases for the remaining targets:
+
+```
+Host clinic-a
+    ProxyCommand rtunnel connect clinic-a
+
+Host winbox
+    ProxyCommand rtunnel connect clinic-a winbox:22
+
+Host nas-445
+    ProxyCommand rtunnel connect clinic-a nas:445
+```
+
+The client never needs to know the target IP, and the aliases come straight
+from the agent's allowlist. None of the target names need to resolve on the
+client: the agent resolves them on the LAN.
+
+Manage the allowlist on the agent host without re-enrolling:
+
+```bash
+sudo rtunnel-agent targets list
+sudo rtunnel-agent targets add winbox:22
+sudo rtunnel-agent targets set winbox:22 nas:445  # first entry is the default
+sudo systemctl restart rtunnel-agent
+```
 
 ### Windows Client
 
@@ -108,17 +159,20 @@ The Windows installer:
 - adds an absolute `Include` for `%USERPROFILE%\.ssh\rtunnel.d\*` to
   `%USERPROFILE%\.ssh\config` (use `-NoSshConfig` to skip),
 - verifies the release SHA-256 checksum when `SHA256SUMS` is available,
-- enrolls the client when a URI is supplied.
+- enrolls the client and writes SSH host entries for every granted agent
+  (use `-NoSshHosts` to skip discovery).
 
 Open a new terminal after installation so the updated `PATH` takes effect, then
-generate the SSH host entry and connect:
+connect by agent name:
 
 ```powershell
-rtunnel ssh-config clinic-a --write
+rtunnel agents
 ssh user@clinic-a
 ```
 
-Use `-Version v0.2.0` to pin a release, `-BinaryPath .\rtunnel.exe` to install a
+Regenerate host entries at any time with `rtunnel ssh-config --all --write`.
+
+Use `-Version v0.4.0` to pin a release, `-BinaryPath .\rtunnel.exe` to install a
 binary you already built, and `-DownloadBase <url>` to use a mirror. The
 environment variables used by `install.sh` (`RTUNNEL_VERSION`, `RTUNNEL_REPO`,
 `RTUNNEL_TARGET`, `RTUNNEL_BIN`, `RTUNNEL_BIN_DIR`, `RTUNNEL_DOWNLOAD_BASE`) are
@@ -130,7 +184,7 @@ The bootstrapper uses GitHub releases. Override the release or target when neede
 
 ```bash
 # Install a specific release
-sudo RTUNNEL_VERSION=v0.2.0 bash -s -- relay < scripts/install.sh
+sudo RTUNNEL_VERSION=v0.4.0 bash -s -- relay < scripts/install.sh
 
 # Install a binary you already built or downloaded
 sudo RTUNNEL_BIN=/path/to/rtunneld ./scripts/install-relay.sh
@@ -187,31 +241,20 @@ docker compose -f deploy/docker-compose.yml up -d relay
 
 The relay is now listening on UDP port `4433`.
 
-### 4. Create Single-Use Enrollment Tokens
+### 4. Pair the Agent and Client
 
 ```bash
-# Generate agent token
 docker compose -f deploy/docker-compose.yml exec relay \
-  /usr/local/bin/rtunneld token create \
-    --role agent \
-    --name clinic-a \
-    --ttl 15m \
+  /usr/local/bin/rtunneld pair \
+    --agent clinic-a \
+    --client laptop \
     --relay-host relay.example.com \
     --relay-port 4433
-
-# Generate client token
-docker compose -f deploy/docker-compose.yml exec relay \
-  /usr/local/bin/rtunneld token create \
-    --role client \
-    --name laptop \
-    --ttl 15m \
-    --relay-host relay.example.com \
-    --relay-port 4433
-
-# Grant client permission to connect to agent
-docker compose -f deploy/docker-compose.yml exec relay \
-  /usr/local/bin/rtunneld grant add laptop clinic-a
 ```
+
+This creates both enrollment tokens and grants `laptop` access to `clinic-a`.
+Use `token create` plus `grant add` instead if you need separate TTLs or want to
+issue tokens individually.
 
 ### 5. Enroll and Run the Agent via Docker
 
@@ -247,6 +290,9 @@ If no local release binary is present, the scripts download the matching prebuil
 ## Admin Commands (`rtunneld`)
 
 ```bash
+# Issue both tokens and grant access in one command
+rtunneld pair --agent clinic-a --client laptop --relay-host relay.example.com
+
 # List all active peers
 rtunneld peers list
 

@@ -7,7 +7,7 @@ use rtunnel_agent::{AgentConfig, AgentRunner};
 use rtunnel_identity::{
     EnrollmentUri, PinnedServerVerifier, generate_identity, load_identity, save_identity,
 };
-use rtunnel_proto::{ALPN_ENROLL, ControlMessage};
+use rtunnel_proto::{ALPN_ENROLL, ControlMessage, HostPort};
 use rtunnel_transport::{create_client_endpoint, make_client_config, read_frame, write_frame};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -36,6 +36,11 @@ enum Command {
     },
     /// Run the agent connector daemon.
     Run,
+    /// Inspect or change the destinations this agent may dial.
+    Targets {
+        #[command(subcommand)]
+        action: TargetCommand,
+    },
     /// Install this binary and a hardened systemd unit.
     Install {
         /// Optional enrollment URI; the agent is enrolled before the service starts.
@@ -48,6 +53,92 @@ enum Command {
         #[arg(long)]
         no_start: bool,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum TargetCommand {
+    /// List allowed targets in priority order.
+    List,
+    /// Append a target to the allowlist.
+    Add {
+        /// Destination in `host:port` form.
+        target: String,
+    },
+    /// Remove a target from the allowlist.
+    Remove {
+        /// Destination in `host:port` form.
+        target: String,
+    },
+    /// Replace the allowlist. The first entry becomes the default target.
+    Set {
+        /// Destinations in `host:port` form.
+        targets: Vec<String>,
+    },
+}
+
+fn validate_target(target: &str) -> Result<()> {
+    if HostPort::parse(target).is_err() {
+        bail!("target must be in host:port form, got '{target}'");
+    }
+    Ok(())
+}
+
+/// Loads, edits, and saves the agent allowlist.
+fn manage_targets(state_dir: &Path, action: TargetCommand) -> Result<()> {
+    let mut config = AgentConfig::load(state_dir)
+        .context("failed to load agent config; run 'enroll' first (system installs need sudo)")?;
+
+    match action {
+        TargetCommand::List => {
+            if config.allowed_targets.is_empty() {
+                println!("No allowed targets configured.");
+            } else {
+                println!("Allowed targets (first is the default):");
+                for target in &config.allowed_targets {
+                    println!("  {target}");
+                }
+            }
+            return Ok(());
+        }
+        TargetCommand::Add { target } => {
+            validate_target(&target)?;
+            if config.allowed_targets.contains(&target) {
+                println!("{target} is already allowed.");
+                return Ok(());
+            }
+            config.allowed_targets.push(target.clone());
+            config.save(state_dir)?;
+            println!("Added {target}.");
+        }
+        TargetCommand::Remove { target } => {
+            let before = config.allowed_targets.len();
+            config.allowed_targets.retain(|entry| entry != &target);
+            if config.allowed_targets.len() == before {
+                println!("{target} is not in the allowlist.");
+                return Ok(());
+            }
+            config.save(state_dir)?;
+            println!("Removed {target}.");
+        }
+        TargetCommand::Set { targets } => {
+            if targets.is_empty() {
+                bail!("at least one target is required");
+            }
+            for target in &targets {
+                validate_target(target)?;
+            }
+            config.allowed_targets = targets;
+            config.save(state_dir)?;
+            println!("Updated allowed targets.");
+        }
+    }
+
+    println!(
+        "Allowed targets (first is the default): {}",
+        config.allowed_targets.join(", ")
+    );
+    println!("Restart the agent to apply the change: sudo systemctl restart rtunnel-agent");
+    Ok(())
 }
 
 /// Enrolls this agent and persists its identity and configuration.
@@ -199,6 +290,9 @@ async fn main() -> Result<()> {
             allowed_target,
         } => {
             enroll_agent(&cli.state_dir, &uri, allowed_target).await?;
+        }
+        Command::Targets { action } => {
+            manage_targets(&cli.state_dir, action)?;
         }
         Command::Run => {
             let config = AgentConfig::load(&cli.state_dir)

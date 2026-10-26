@@ -12,10 +12,13 @@ use rtunnel_identity::{
     EnrollmentUri, KeyMaterial, PinnedServerVerifier, generate_identity, is_valid_name,
     load_identity, save_identity,
 };
-use rtunnel_proto::{ALPN_ENROLL, ALPN_TUNNEL, ControlMessage, HostPort, ResultStatus};
+use rtunnel_proto::{
+    ALPN_ENROLL, ALPN_TUNNEL, AgentDetail, ControlMessage, HostPort, ResultStatus,
+};
 use rtunnel_transport::{
     create_client_endpoint, make_client_config, read_frame, splice_quic_to_stdio, write_frame,
 };
+use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -56,15 +59,18 @@ enum Command {
     },
     /// Query the relay for granted agents and their online status.
     Agents,
-    /// Print a ready-to-paste OpenSSH configuration block.
+    /// Print or write ready-to-paste OpenSSH configuration blocks.
     SshConfig {
-        /// Name of the target agent.
-        agent: String,
-        /// Optional destination host:port on the agent LAN (defaults to port 22).
+        /// Name of the target agent. Omit when using `--all`.
+        agent: Option<String>,
+        /// Optional destination host:port on the agent LAN.
         target: Option<String>,
         /// Write the snippet to `~/.ssh/rtunnel.d/<agent>.conf` instead of stdout.
         #[arg(long)]
         write: bool,
+        /// Write snippets for every agent granted to this client.
+        #[arg(long)]
+        all: bool,
     },
     /// Install this binary, configure OpenSSH, and optionally enroll.
     Install {
@@ -78,6 +84,9 @@ enum Command {
         /// Do not add the rtunnel snippet directory to `~/.ssh/config`.
         #[arg(long)]
         no_ssh_config: bool,
+        /// Do not create OpenSSH host entries for granted agents after enrolling.
+        #[arg(long)]
+        no_ssh_hosts: bool,
         /// Do not add the install directory to the user `PATH` (Windows).
         #[arg(long)]
         no_path: bool,
@@ -261,8 +270,11 @@ async fn connect(state_dir: &Path, agent: String, target: Option<&str>) -> Resul
     }
 }
 
-/// Prints the agents granted to this client and whether each is online.
-async fn list_agents(state_dir: &Path) -> Result<()> {
+/// Queries the relay for granted agents and their advertised targets.
+///
+/// Relays from before target discovery reject `ListAgentsDetailed`, so the
+/// client falls back to the original `ListAgents` query and reports no targets.
+async fn fetch_agents(state_dir: &Path) -> Result<Vec<AgentDetail>> {
     let (config, id) = load_client_state(state_dir)?;
 
     let verifier = Arc::new(PinnedServerVerifier::new(&config.relay_fingerprint));
@@ -276,19 +288,56 @@ async fn list_agents(state_dir: &Path) -> Result<()> {
     .await?;
 
     let (mut send, mut recv) = connection.open_bi().await?;
-    let req = ControlMessage::ListAgents {
-        client_name: config.client_name,
+    let req = ControlMessage::ListAgentsDetailed {
+        client_name: config.client_name.clone(),
     };
     write_frame(&mut send, &req).await?;
 
-    let ControlMessage::ListAgentsResponse { agents } = read_frame(&mut recv).await? else {
-        bail!("unexpected response from relay");
-    };
+    match read_frame(&mut recv).await? {
+        ControlMessage::AgentsDetailedResponse { agents } => Ok(agents),
+        ControlMessage::Error { .. } => {
+            // Revision 1 relay: retry with the original query on a fresh stream.
+            let (mut send, mut recv) = connection.open_bi().await?;
+            let req = ControlMessage::ListAgents {
+                client_name: config.client_name,
+            };
+            write_frame(&mut send, &req).await?;
+            match read_frame(&mut recv).await? {
+                ControlMessage::ListAgentsResponse { agents } => Ok(agents
+                    .into_iter()
+                    .map(|a| AgentDetail {
+                        name: a.name,
+                        online: a.online,
+                        targets: Vec::new(),
+                    })
+                    .collect()),
+                other => bail!("unexpected response from relay: {other:?}"),
+            }
+        }
+        other => bail!("unexpected response from relay: {other:?}"),
+    }
+}
 
-    println!("{:<24} STATUS", "AGENT");
+/// Prints the agents granted to this client, their status, and their targets.
+async fn list_agents(state_dir: &Path) -> Result<()> {
+    let agents = fetch_agents(state_dir).await?;
+
+    println!(
+        "{:<24} {:<8} {:<20} OTHER TARGETS",
+        "AGENT", "STATUS", "DEFAULT TARGET"
+    );
     for a in agents {
         let status = if a.online { "online" } else { "offline" };
-        println!("{:<24} {status}", a.name);
+        let default = a
+            .targets
+            .first()
+            .map_or_else(|| String::from("-"), Clone::clone);
+        let others = if a.targets.len() > 1 {
+            a.targets[1..].join(", ")
+        } else {
+            String::from("-")
+        };
+        println!("{:<24} {status:<8} {default:<20} {others}", a.name);
     }
     Ok(())
 }
@@ -318,6 +367,7 @@ async fn install_client(
     uri: Option<&str>,
     bin_dir: Option<PathBuf>,
     no_ssh_config: bool,
+    no_ssh_hosts: bool,
     no_path: bool,
 ) -> Result<()> {
     let bin_dir = match bin_dir {
@@ -368,46 +418,242 @@ async fn install_client(
 
     if let Some(uri) = uri {
         enroll(state_dir, uri).await?;
+
+        if !no_ssh_config && !no_ssh_hosts {
+            match write_all_ssh_configs(state_dir).await {
+                Ok(hosts) if hosts.is_empty() => println!(
+                    "No agent grants found yet; run 'rtunnel ssh-config --all --write' after a grant is added."
+                ),
+                Ok(hosts) => {
+                    println!("Configured SSH hosts for: {}", hosts.join(", "));
+                    println!("Connect with: ssh <user>@{}", hosts[0]);
+                }
+                Err(e) => eprintln!(
+                    "warning: could not create SSH host entries yet ({e:#}); run 'rtunnel ssh-config --all --write' after the agent is online"
+                ),
+            }
+        }
     } else {
         println!("Enroll with: rtunnel enroll \"rtunnel://...\"");
     }
-    println!("Add an SSH host with: rtunnel ssh-config <agent>");
+    println!("Add SSH hosts later with: rtunnel ssh-config --all --write");
 
     Ok(())
 }
 
+/// One generated OpenSSH host entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SshHost {
+    /// `Host` line value.
+    alias: String,
+    /// Agent that terminates the tunnel.
+    agent: String,
+    /// Explicit target, or `None` to use the agent's default target.
+    target: Option<String>,
+}
+
 /// Builds an OpenSSH `Host` block that proxies through `rtunnel connect`.
-fn ssh_config_snippet(agent: &str, target: Option<&str>) -> String {
+fn ssh_config_snippet(host_alias: &str, agent: &str, target: Option<&str>) -> String {
     let target_suffix = target.map_or(String::new(), |dest| format!(" {dest}"));
-    format!("Host {agent}\n    ProxyCommand rtunnel connect {agent}{target_suffix}\n")
+    format!("Host {host_alias}\n    ProxyCommand rtunnel connect {agent}{target_suffix}\n")
 }
 
-/// Prints an OpenSSH `Host` block that proxies through `rtunnel connect`.
-fn print_ssh_config(agent: &str, target: Option<&str>) {
-    print!("{}", ssh_config_snippet(agent, target));
+/// Derives a short, stable SSH alias for an advertised target.
+///
+/// `winbox:22` becomes `winbox`; a non-standard port becomes `winbox-3389`.
+/// Names that collide with the agent name or another alias are prefixed and,
+/// if needed, numbered.
+fn target_alias(agent: &str, target: &str, used: &mut BTreeSet<String>) -> Option<String> {
+    let hp = HostPort::parse(target).ok()?;
+    let mut base = hp.host.to_ascii_lowercase();
+    if hp.port != 22 {
+        base.push('-');
+        base.push_str(&hp.port.to_string());
+    }
+
+    if base.is_empty()
+        || base.len() > 253
+        || base == agent
+        || base.contains(':')
+        || base
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, '*' | '?' | '!'))
+    {
+        return None;
+    }
+
+    let mut alias = base.clone();
+    if used.contains(&alias) {
+        alias = format!("{agent}-{base}");
+    }
+    let mut suffix = 2_u32;
+    while used.contains(&alias) {
+        alias = format!("{agent}-{base}-{suffix}");
+        suffix += 1;
+    }
+    used.insert(alias.clone());
+    Some(alias)
 }
 
-/// Writes an OpenSSH snippet into `~/.ssh/rtunnel.d/<agent>.conf`.
-fn write_ssh_config(agent: &str, target: Option<&str>) -> Result<()> {
+/// Builds every host entry for an agent: its default plus one alias per target.
+fn ssh_hosts(agent: &str, targets: &[String]) -> Vec<SshHost> {
+    let mut used = BTreeSet::from([agent.to_string()]);
+    let mut hosts = vec![SshHost {
+        alias: agent.to_string(),
+        agent: agent.to_string(),
+        target: None,
+    }];
+
+    // The first target is already covered by the target-less `Host <agent>`
+    // entry. Skipping it avoids aliases such as `Host 127.0.0.1` that would
+    // shadow an unrelated local destination.
+    for target in targets.iter().skip(1) {
+        if let Some(alias) = target_alias(agent, target, &mut used) {
+            hosts.push(SshHost {
+                alias,
+                agent: agent.to_string(),
+                target: Some(target.clone()),
+            });
+        }
+    }
+    hosts
+}
+
+/// Renders host entries as OpenSSH configuration text.
+fn render_snippets(hosts: &[SshHost]) -> String {
+    hosts
+        .iter()
+        .map(|host| ssh_config_snippet(&host.alias, &host.agent, host.target.as_deref()))
+        .collect()
+}
+
+/// Writes an agent's host entries to `~/.ssh/rtunnel.d/<agent>.conf`.
+fn write_agent_snippet(snippets: &Path, agent: &str, hosts: &[SshHost]) -> Result<PathBuf> {
+    if !is_valid_name(agent) {
+        bail!("refusing to write a snippet for invalid agent name '{agent}'");
+    }
+    let path = snippets.join(format!("{agent}.conf"));
+    std::fs::write(&path, render_snippets(hosts))
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(path)
+}
+
+/// Looks up an agent's advertised targets, warning instead of failing when the
+/// relay is unreachable or predates target discovery.
+async fn resolve_agent_targets(state_dir: &Path, agent: &str) -> Vec<String> {
+    match fetch_agents(state_dir).await {
+        Ok(agents) => agents
+            .into_iter()
+            .find(|a| a.name == agent)
+            .map_or_else(Vec::new, |a| a.targets),
+        Err(e) => {
+            eprintln!(
+                "warning: could not discover targets for '{agent}' ({e:#}); using the agent default"
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Prints OpenSSH host entries for one agent, discovering targets when omitted.
+async fn print_ssh_config(state_dir: &Path, agent: &str, target: Option<&str>) -> Result<()> {
     if !is_valid_name(agent) {
         bail!("agent name must match [a-z0-9-]{{1,63}}");
     }
-    if let Some(dest) = target {
+
+    let hosts = if let Some(dest) = target {
         HostPort::parse(dest)
             .map_err(|_| anyhow!("invalid target host:port specification: {dest}"))?;
+        vec![SshHost {
+            alias: agent.to_string(),
+            agent: agent.to_string(),
+            target: Some(dest.to_string()),
+        }]
+    } else {
+        ssh_hosts(agent, &resolve_agent_targets(state_dir, agent).await)
+    };
+
+    print!("{}", render_snippets(&hosts));
+    Ok(())
+}
+
+/// Writes OpenSSH snippets for one agent, or for every granted agent with `--all`.
+async fn write_ssh_config(
+    state_dir: &Path,
+    agent: Option<&str>,
+    target: Option<&str>,
+    all: bool,
+) -> Result<()> {
+    if all && (agent.is_some() || target.is_some()) {
+        bail!("--all writes every granted agent and cannot be combined with an agent or target");
     }
+
+    let planned: Vec<(String, Vec<SshHost>)> = if all {
+        fetch_agents(state_dir)
+            .await?
+            .into_iter()
+            .map(|a| (a.name.clone(), ssh_hosts(&a.name, &a.targets)))
+            .collect()
+    } else {
+        let agent = agent.context("an agent name is required (or use --all)")?;
+        if !is_valid_name(agent) {
+            bail!("agent name must match [a-z0-9-]{{1,63}}");
+        }
+
+        let hosts = if let Some(dest) = target {
+            HostPort::parse(dest)
+                .map_err(|_| anyhow!("invalid target host:port specification: {dest}"))?;
+            vec![SshHost {
+                alias: agent.to_string(),
+                agent: agent.to_string(),
+                target: Some(dest.to_string()),
+            }]
+        } else {
+            ssh_hosts(agent, &resolve_agent_targets(state_dir, agent).await)
+        };
+        vec![(agent.to_string(), hosts)]
+    };
 
     let home = BaseDirs::new()
         .map(|dirs| dirs.home_dir().to_path_buf())
         .context("cannot determine home directory")?;
     let snippets = rtunnel_install::configure_ssh_include(&home)
         .context("failed to configure the OpenSSH include")?;
-    let path = snippets.join(format!("{agent}.conf"));
-    std::fs::write(&path, ssh_config_snippet(agent, target))
-        .with_context(|| format!("failed to write {}", path.display()))?;
 
-    println!("Wrote {}", path.display());
+    if planned.is_empty() {
+        println!("No granted agents found; nothing to write.");
+        return Ok(());
+    }
+
+    for (name, hosts) in planned {
+        let path = write_agent_snippet(&snippets, &name, &hosts)?;
+        println!("Wrote {}", path.display());
+    }
     Ok(())
+}
+
+/// Writes snippets for every granted agent, returning the agent names written.
+async fn write_all_ssh_configs(state_dir: &Path) -> Result<Vec<String>> {
+    let agents = fetch_agents(state_dir).await?;
+    let home = BaseDirs::new()
+        .map(|dirs| dirs.home_dir().to_path_buf())
+        .context("cannot determine home directory")?;
+    let snippets = rtunnel_install::configure_ssh_include(&home)
+        .context("failed to configure the OpenSSH include")?;
+
+    let mut written = Vec::new();
+    for agent in agents {
+        if !is_valid_name(&agent.name) {
+            continue;
+        }
+        write_agent_snippet(
+            &snippets,
+            &agent.name,
+            &ssh_hosts(&agent.name, &agent.targets),
+        )?;
+        written.push(agent.name);
+    }
+    Ok(written)
 }
 
 #[tokio::main]
@@ -446,11 +692,16 @@ async fn main() -> Result<()> {
             agent,
             target,
             write,
+            all,
         } => {
             if write {
-                write_ssh_config(&agent, target.as_deref())?;
+                write_ssh_config(&state_dir, agent.as_deref(), target.as_deref(), all).await?;
             } else {
-                print_ssh_config(&agent, target.as_deref());
+                if all {
+                    bail!("--all requires --write");
+                }
+                let agent = agent.context("an agent name is required")?;
+                print_ssh_config(&state_dir, &agent, target.as_deref()).await?;
             }
             Ok(())
         }
@@ -458,7 +709,93 @@ async fn main() -> Result<()> {
             uri,
             bin_dir,
             no_ssh_config,
+            no_ssh_hosts,
             no_path,
-        } => install_client(&state_dir, uri.as_deref(), bin_dir, no_ssh_config, no_path).await,
+        } => {
+            install_client(
+                &state_dir,
+                uri.as_deref(),
+                bin_dir,
+                no_ssh_config,
+                no_ssh_hosts,
+                no_path,
+            )
+            .await
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SshHost, render_snippets, ssh_config_snippet, ssh_hosts};
+
+    fn target(value: &str) -> String {
+        value.to_string()
+    }
+
+    #[test]
+    fn builds_default_and_target_aliases() {
+        let hosts = ssh_hosts("clinic-a", &[target("winbox:22"), target("nas:445")]);
+
+        assert_eq!(
+            hosts[0],
+            SshHost {
+                alias: "clinic-a".into(),
+                agent: "clinic-a".into(),
+                target: None,
+            }
+        );
+        // The first target is the default and is reached through `clinic-a`.
+        assert!(!hosts.iter().any(|host| host.alias == "winbox"));
+        assert!(
+            hosts.iter().any(|host| {
+                host.alias == "nas-445" && host.target.as_deref() == Some("nas:445")
+            })
+        );
+    }
+
+    #[test]
+    fn single_target_only_creates_the_default_entry() {
+        let hosts = ssh_hosts("winbox", &[target("winbox:22")]);
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].alias, "winbox");
+        assert!(hosts[0].target.is_none());
+    }
+
+    #[test]
+    fn duplicate_aliases_are_numbered() {
+        let hosts = ssh_hosts(
+            "agent",
+            &[
+                target("winbox:22"),
+                target("winbox:22"),
+                target("winbox:22"),
+            ],
+        );
+        let aliases: Vec<&str> = hosts.iter().map(|host| host.alias.as_str()).collect();
+        assert_eq!(aliases, vec!["agent", "winbox", "agent-winbox"]);
+    }
+
+    #[test]
+    fn ipv6_targets_do_not_create_aliases() {
+        let hosts = ssh_hosts("agent", &[target("127.0.0.1:22"), target("[::1]:22")]);
+        assert_eq!(hosts.len(), 1);
+    }
+
+    #[test]
+    fn renders_proxy_command() {
+        assert_eq!(
+            ssh_config_snippet("winbox", "clinic-a", Some("winbox:22")),
+            "Host winbox\n    ProxyCommand rtunnel connect clinic-a winbox:22\n"
+        );
+    }
+
+    #[test]
+    fn renders_all_hosts() {
+        let hosts = ssh_hosts("clinic-a", &[target("winbox:22"), target("nas:445")]);
+        let rendered = render_snippets(&hosts);
+        assert!(rendered.contains("Host clinic-a\n"));
+        assert!(rendered.contains("Host nas-445\n"));
+        assert!(rendered.contains("ProxyCommand rtunnel connect clinic-a nas:445\n"));
     }
 }

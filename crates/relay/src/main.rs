@@ -65,6 +65,24 @@ enum Command {
         #[command(subcommand)]
         action: GrantCommand,
     },
+    /// Issue both enrollment tokens and grant access in one step.
+    Pair {
+        /// Name of the agent peer to enroll.
+        #[arg(long)]
+        agent: String,
+        /// Name of the client peer to enroll.
+        #[arg(long)]
+        client: String,
+        #[arg(long, default_value = "/var/lib/rtunnel")]
+        state_dir: PathBuf,
+        #[arg(long, default_value = "15m")]
+        ttl: String,
+        /// Public hostname or IP that peers use to reach this relay.
+        #[arg(long)]
+        relay_host: String,
+        #[arg(long, default_value_t = 4433)]
+        relay_port: u16,
+    },
     /// List all enrolled peers.
     PeersList {
         #[arg(long, default_value = "/var/lib/rtunnel")]
@@ -90,7 +108,8 @@ enum TokenCommand {
         ttl: String,
         #[arg(long, default_value = "/var/lib/rtunnel")]
         state_dir: PathBuf,
-        #[arg(long, default_value = "127.0.0.1")]
+        /// Public hostname or IP that peers use to reach this relay.
+        #[arg(long)]
         relay_host: String,
         #[arg(long, default_value_t = 4433)]
         relay_port: u16,
@@ -146,6 +165,34 @@ fn parse_ttl(ttl: &str) -> Result<u64> {
     }
     ttl.parse::<u64>()
         .context("invalid TTL numeric seconds format")
+}
+
+/// Generates, persists, and formats a single-use enrollment token.
+fn issue_token(
+    db: &SqliteStore,
+    identity: &KeyMaterial,
+    name: &str,
+    role: &str,
+    relay_host: &str,
+    relay_port: u16,
+    ttl_secs: u64,
+) -> Result<EnrollmentUri> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let expires_at = (now + ttl_secs).cast_signed();
+
+    let mut token_bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut token_bytes);
+    let token = hex_encode(&token_bytes);
+    let token_hash = hex_encode(&Sha256::digest(token.as_bytes()));
+
+    db.store_token(&token_hash, name, role, expires_at)?;
+
+    Ok(EnrollmentUri {
+        host: relay_host.to_owned(),
+        port: relay_port,
+        relay_fingerprint: identity.fingerprint.clone(),
+        token,
+    })
 }
 
 /// Creates the relay identity and SQLite store if they do not exist yet.
@@ -289,26 +336,11 @@ async fn main() -> Result<()> {
                 }
 
                 let ttl_secs = parse_ttl(&ttl)?;
-                let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-                let expires_at = (now + ttl_secs).cast_signed();
-
-                let mut token_bytes = [0u8; 32];
-                rand::thread_rng().fill_bytes(&mut token_bytes);
-                let token = hex_encode(&token_bytes);
-                let token_hash = hex_encode(&Sha256::digest(token.as_bytes()));
-
                 let db = SqliteStore::open(state_dir.join("rtunnel.db"))?;
-                db.store_token(&token_hash, &name, &role, expires_at)?;
-
                 let id = load_identity(&state_dir)?;
-                let uri = EnrollmentUri {
-                    host: relay_host,
-                    port: relay_port,
-                    relay_fingerprint: id.fingerprint,
-                    token: token.clone(),
-                };
+                let uri = issue_token(&db, &id, &name, &role, &relay_host, relay_port, ttl_secs)?;
 
-                println!("Single-use token: {token}");
+                println!("Single-use token: {}", uri.token);
                 println!("Enrollment URI:   {uri}");
             }
             TokenCommand::List { state_dir } => {
@@ -371,6 +403,49 @@ async fn main() -> Result<()> {
                 }
             }
         },
+        Command::Pair {
+            agent,
+            client,
+            state_dir,
+            ttl,
+            relay_host,
+            relay_port,
+        } => {
+            if !is_valid_name(&agent) || !is_valid_name(&client) {
+                bail!("agent and client names must match [a-z0-9-]{{1,63}}");
+            }
+            if agent == client {
+                bail!("agent and client names must differ");
+            }
+
+            let ttl_secs = parse_ttl(&ttl)?;
+            let db = SqliteStore::open(state_dir.join("rtunnel.db"))?;
+            let id = load_identity(&state_dir)?;
+
+            let agent_uri =
+                issue_token(&db, &id, &agent, "agent", &relay_host, relay_port, ttl_secs)?;
+            let client_uri = issue_token(
+                &db,
+                &id,
+                &client,
+                "client",
+                &relay_host,
+                relay_port,
+                ttl_secs,
+            )?;
+            db.add_grant(&client, &agent)?;
+            let audit = AuditLogger::open(&state_dir)?;
+            audit.log_grant_change("add", &client, &agent);
+
+            println!("Agent enrollment URI:  {agent_uri}");
+            println!("Client enrollment URI: {client_uri}");
+            println!("Granted '{client}' access to '{agent}'.");
+            println!();
+            println!("Install the agent on the LAN host:");
+            println!("  sudo rtunnel-agent install \"{agent_uri}\" --allowed-target <host:port>");
+            println!("Install the client on this workstation:");
+            println!("  rtunnel install \"{client_uri}\"");
+        }
         Command::PeersList { state_dir } => {
             let db = SqliteStore::open(state_dir.join("rtunnel.db"))?;
             let peers = db.list_peers()?;

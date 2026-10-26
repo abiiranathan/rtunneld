@@ -344,6 +344,72 @@ async fn test_disallowed_target_rejected_by_agent() {
 }
 
 #[tokio::test]
+async fn test_agent_advertises_targets_for_client_discovery() {
+    let harness = TestHarness::start();
+    let agent_id = harness.enroll_peer("agent-disc", "agent").await;
+    let client_id = harness.enroll_peer("client-disc", "client").await;
+    harness
+        .store
+        .add_grant("client-disc", "agent-disc")
+        .unwrap();
+
+    let advertised = vec!["winbox:22".to_string(), "nas:445".to_string()];
+    let agent_cfg = AgentConfig {
+        relay_host: harness.relay_addr.ip().to_string(),
+        relay_port: harness.relay_addr.port(),
+        relay_fingerprint: harness.relay_identity.fingerprint.clone(),
+        agent_name: "agent-disc".into(),
+        allowed_targets: advertised.clone(),
+        max_sessions: 64,
+    };
+    tokio::spawn(AgentRunner::new(agent_cfg, agent_id).run());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let endpoint = create_client_endpoint("0.0.0.0:0".parse().unwrap()).unwrap();
+    let verifier = Arc::new(PinnedServerVerifier::new(
+        &harness.relay_identity.fingerprint,
+    ));
+    let client_config = make_client_config(
+        &client_id.certificate_der,
+        &client_id.private_key_pem,
+        verifier,
+        vec![ALPN_TUNNEL.to_vec()],
+    )
+    .unwrap();
+
+    let conn = endpoint
+        .connect_with(
+            client_config,
+            harness.relay_addr,
+            &harness.relay_addr.ip().to_string(),
+        )
+        .unwrap()
+        .await
+        .unwrap();
+
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    write_frame(
+        &mut send,
+        &ControlMessage::ListAgentsDetailed {
+            client_name: "client-disc".into(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let ControlMessage::AgentsDetailedResponse { agents } = read_frame(&mut recv).await.unwrap()
+    else {
+        panic!("expected AgentsDetailedResponse");
+    };
+    let agent = agents
+        .iter()
+        .find(|a| a.name == "agent-disc")
+        .expect("granted agent must be listed");
+    assert!(agent.online);
+    assert_eq!(agent.targets, advertised);
+}
+
+#[tokio::test]
 async fn test_revocation_terminates_agent_live_session() {
     let harness = TestHarness::start();
     let agent_id = harness.enroll_peer("agent-rev", "agent").await;
