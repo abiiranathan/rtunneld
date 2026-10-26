@@ -13,6 +13,7 @@ bytes = { workspace = true }
 postcard = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

@@ -7,6 +7,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+assert_cmd = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }
 quinn = { workspace = true }
 rustls = { workspace = true }
@@ -19,6 +20,9 @@ rtunnel-transport = { path = "../crates/transport" }
 rtunnel-relay = { path = "../crates/relay" }
 rtunnel-agent = { path = "../crates/agent" }
 rtunnel-client = { path = "../crates/client" }
+
+[dev-dependencies]
+serde_json = "1"
 
 [[test]]
 name = "integration_test"
