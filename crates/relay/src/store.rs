@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::all, clippy::pedantic)]
 
+use rand::Rng;
 use rusqlite::{Connection, OptionalExtension, Result as SqliteResult, params};
 use std::path::Path;
 use std::sync::Mutex;
@@ -17,9 +18,9 @@ fn current_epoch_seconds() -> i64 {
 /// Database record for an enrolled peer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PeerRecord {
-    /// Peer unique name.
+    /// Peer unique name or 9-digit Device ID.
     pub name: String,
-    /// Peer role (`"agent"` or `"client"`).
+    /// Peer role (`"agent"`, `"client"`, or `"node"`).
     pub role: String,
     /// Pinned `SubjectPublicKeyInfo` hex fingerprint.
     pub fingerprint: String,
@@ -30,13 +31,13 @@ pub struct PeerRecord {
 /// Database record for a single-use enrollment token.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TokenRecord {
-    /// SHA-256 hash of the enrollment token.
+    /// Hash of the enrollment token.
     pub token_hash: String,
-    /// Peer name bound to the token.
+    /// Name of the peer the token enrolls.
     pub name: String,
-    /// Role authorized for this token.
+    /// Role granted to the peer on enrollment.
     pub role: String,
-    /// Expiration timestamp in seconds since the UNIX epoch.
+    /// Expiry as seconds since the Unix epoch.
     pub expires_at: i64,
 }
 
@@ -47,11 +48,13 @@ pub struct SqliteStore {
 
 #[allow(clippy::missing_panics_doc)]
 impl SqliteStore {
-    /// Opens the SQLite database in WAL mode and runs schema migrations.
+    /// Opens (or creates) the database at `path`, enables WAL mode, and
+    /// ensures all tables exist.
     ///
     /// # Errors
     ///
-    /// Returns a [`rusqlite::Error`] if the database cannot be created, locked, or migrated.
+    /// Returns an error if the database file cannot be opened, a pragma
+    /// cannot be applied, or any of the schema statements fail.
     pub fn open(path: impl AsRef<Path>) -> SqliteResult<Self> {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -89,9 +92,6 @@ impl SqliteStore {
             (),
         )?;
 
-        // Last targets advertised by each agent. Kept separately from `peers`
-        // so enrollment never has to know about target discovery, and so the
-        // relay can still describe an agent while it is offline.
         conn.execute(
             "CREATE TABLE IF NOT EXISTS agent_targets (
                 agent_name TEXT PRIMARY KEY,
@@ -101,16 +101,164 @@ impl SqliteStore {
             (),
         )?;
 
+        // Active pairing codes for AnyDesk-style rendezvous
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS pairing_codes (
+                device_id TEXT PRIMARY KEY,
+                code_hash TEXT NOT NULL,
+                expires_at INTEGER NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0
+            )",
+            (),
+        )?;
+
         Ok(Self {
             conn: Mutex::new(conn),
         })
     }
 
-    /// Stores or updates an enrolled peer.
+    /// Allocates or retrieves a unique 9-digit Device ID for a given fingerprint.
     ///
     /// # Errors
     ///
-    /// Returns a [`rusqlite::Error`] if the statement execution fails.
+    /// Returns an error if any database query fails, or
+    /// [`rusqlite::Error::QueryReturnedNoRows`] if a unique Device ID could
+    /// not be generated after 100 attempts.
+    pub fn get_or_allocate_device_id(
+        &self,
+        fingerprint: &str,
+        label: &str,
+    ) -> SqliteResult<String> {
+        let lock = self.conn.lock().expect("lock acquired");
+
+        // Check if this fingerprint already has a record
+        let existing: Option<String> = lock
+            .query_row(
+                "SELECT name FROM peers WHERE fingerprint = ?1",
+                [fingerprint],
+                |r| r.get(0),
+            )
+            .optional()?;
+
+        if let Some(id) = existing {
+            return Ok(id);
+        }
+
+        // Generate a random 9-digit Device ID (100 000 000 to 999 999 999)
+        let mut rng = rand::thread_rng();
+        let mut attempts = 0;
+        let device_id = loop {
+            let candidate = rng.gen_range(100_000_000..=999_999_999).to_string();
+            let exists: i64 = lock.query_row(
+                "SELECT COUNT(*) FROM peers WHERE name = ?1",
+                [&candidate],
+                |r| r.get(0),
+            )?;
+            if exists == 0 {
+                break candidate;
+            }
+            attempts += 1;
+            if attempts > 100 {
+                return Err(rusqlite::Error::QueryReturnedNoRows);
+            }
+        };
+
+        let now = current_epoch_seconds();
+        lock.execute(
+            "INSERT INTO peers (name, role, fingerprint, revoked, created_at)
+             VALUES (?1, 'node', ?2, 0, ?3)",
+            params![device_id, fingerprint, now],
+        )?;
+
+        // Default grant: each device can connect to its own label
+        let _ = lock.execute(
+            "INSERT OR IGNORE INTO grants (client_name, agent_name, created_at) VALUES (?1, ?1, ?2)",
+            params![device_id, now],
+        );
+
+        let _ = label;
+        Ok(device_id)
+    }
+
+    /// Stores a pairing code hash for `device_id`, replacing any existing
+    /// code and resetting its attempt counter.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the insert or update fails.
+    pub fn set_pairing_code(
+        &self,
+        device_id: &str,
+        code_hash: &str,
+        ttl_secs: u32,
+    ) -> SqliteResult<()> {
+        let lock = self.conn.lock().expect("lock acquired");
+        let expires_at = current_epoch_seconds() + i64::from(ttl_secs);
+        lock.execute(
+            "INSERT INTO pairing_codes (device_id, code_hash, expires_at, attempts)
+             VALUES (?1, ?2, ?3, 0)
+             ON CONFLICT(device_id) DO UPDATE SET
+                code_hash = excluded.code_hash,
+                expires_at = excluded.expires_at,
+                attempts = 0",
+            params![device_id, code_hash, expires_at],
+        )?;
+        Ok(())
+    }
+
+    /// Verifies a pairing code hash against active records with rate limiting/lockout.
+    ///
+    /// Returns `Ok(false)` if no code exists, the code has expired, the
+    /// attempt limit has been reached, or the hash does not match.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lookup query fails.
+    pub fn verify_pairing_code(&self, device_id: &str, submitted_hash: &str) -> SqliteResult<bool> {
+        let lock = self.conn.lock().expect("lock acquired");
+        let now = current_epoch_seconds();
+
+        let row: Option<(String, i64, i64)> = lock
+            .query_row(
+                "SELECT code_hash, expires_at, attempts FROM pairing_codes WHERE device_id = ?1",
+                [device_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+
+        let Some((stored_hash, expires_at, attempts)) = row else {
+            return Ok(false);
+        };
+
+        if now > expires_at || attempts >= 5 {
+            return Ok(false);
+        }
+
+        // Increment attempt counter
+        let _ = lock.execute(
+            "UPDATE pairing_codes SET attempts = attempts + 1 WHERE device_id = ?1",
+            [device_id],
+        );
+
+        let valid =
+            rtunnel_identity::constant_time_eq(stored_hash.as_bytes(), submitted_hash.as_bytes());
+        if valid {
+            // Delete code after successful validation
+            let _ = lock.execute(
+                "DELETE FROM pairing_codes WHERE device_id = ?1",
+                [device_id],
+            );
+        }
+        Ok(valid)
+    }
+
+    /// Inserts a peer, or updates its role, fingerprint, and revoked flag if
+    /// a peer with the same name already exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the insert or update fails, for example when the
+    /// fingerprint is already pinned to a different peer.
     pub fn upsert_peer(&self, record: &PeerRecord) -> SqliteResult<()> {
         let lock = self.conn.lock().expect("lock acquired");
         let now = current_epoch_seconds();
@@ -132,11 +280,11 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// Queries a peer record by its certificate SPKI fingerprint.
+    /// Looks up a peer by its pinned fingerprint.
     ///
     /// # Errors
     ///
-    /// Returns a [`rusqlite::Error`] on database query failure.
+    /// Returns an error if the query fails or a row cannot be decoded.
     pub fn get_peer_by_fingerprint(&self, fingerprint: &str) -> SqliteResult<Option<PeerRecord>> {
         let lock = self.conn.lock().expect("lock acquired");
         let mut stmt = lock
@@ -154,11 +302,11 @@ impl SqliteStore {
         Ok(row)
     }
 
-    /// Queries a peer record by its unique name.
+    /// Looks up a peer by name (or 9-digit Device ID).
     ///
     /// # Errors
     ///
-    /// Returns a [`rusqlite::Error`] on database query failure.
+    /// Returns an error if the query fails or a row cannot be decoded.
     pub fn get_peer_by_name(&self, name: &str) -> SqliteResult<Option<PeerRecord>> {
         let lock = self.conn.lock().expect("lock acquired");
         let mut stmt =
@@ -176,11 +324,11 @@ impl SqliteStore {
         Ok(row)
     }
 
-    /// Retrieves all registered peers.
+    /// Lists all enrolled peers ordered by name.
     ///
     /// # Errors
     ///
-    /// Returns a [`rusqlite::Error`] on query failure.
+    /// Returns an error if the query fails or any row cannot be decoded.
     pub fn list_peers(&self) -> SqliteResult<Vec<PeerRecord>> {
         let lock = self.conn.lock().expect("lock acquired");
         let mut stmt =
@@ -196,12 +344,12 @@ impl SqliteStore {
         rows.collect()
     }
 
-    /// Records the targets most recently advertised by an agent.
+    /// Replaces the advertised targets for `agent_name`.
     ///
     /// # Errors
     ///
-    /// Returns a [`rusqlite::Error`] when the target list cannot be serialized
-    /// or the statement fails.
+    /// Returns an error if `targets` cannot be serialized to JSON or the
+    /// insert or update fails.
     pub fn set_agent_targets(&self, agent_name: &str, targets: &[String]) -> SqliteResult<()> {
         let encoded = serde_json::to_string(targets)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
@@ -217,12 +365,13 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// Returns the last targets advertised by an agent, or an empty list.
+    /// Returns the advertised targets for `agent_name`, or an empty list if
+    /// none have been stored.
     ///
     /// # Errors
     ///
-    /// Returns a [`rusqlite::Error`] on query failure or when the stored JSON is
-    /// not a string array.
+    /// Returns an error if the query fails or the stored JSON cannot be
+    /// deserialized.
     pub fn get_agent_targets(&self, agent_name: &str) -> SqliteResult<Vec<String>> {
         let lock = self.conn.lock().expect("lock acquired");
         let encoded: Option<String> = lock
@@ -240,11 +389,13 @@ impl SqliteStore {
         })
     }
 
-    /// Revokes a peer by name or fingerprint.
+    /// Marks a peer, matched by name or fingerprint, as revoked.
+    ///
+    /// Returns `true` if at least one peer was updated.
     ///
     /// # Errors
     ///
-    /// Returns a [`rusqlite::Error`] on execution failure.
+    /// Returns an error if the update fails.
     pub fn revoke_peer(&self, target: &str) -> SqliteResult<bool> {
         let lock = self.conn.lock().expect("lock acquired");
         let updated = lock.execute(
@@ -254,11 +405,12 @@ impl SqliteStore {
         Ok(updated > 0)
     }
 
-    /// Persists a single-use token hash and expiration.
+    /// Stores a single-use enrollment token.
     ///
     /// # Errors
     ///
-    /// Returns a [`rusqlite::Error`] if the token insert fails.
+    /// Returns an error if the insert fails, for example when a token with
+    /// the same hash already exists.
     pub fn store_token(
         &self,
         token_hash: &str,
@@ -276,11 +428,14 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// Validates and deletes a token atomically if it is active.
+    /// Atomically validates and deletes an unexpired token.
+    ///
+    /// Returns `None` if the token does not exist or has expired.
     ///
     /// # Errors
     ///
-    /// Returns a [`rusqlite::Error`] if the transaction fails.
+    /// Returns an error if the transaction cannot be started or committed,
+    /// or if the lookup or delete fails.
     pub fn consume_token(&self, token_hash: &str) -> SqliteResult<Option<TokenRecord>> {
         let mut lock = self.conn.lock().expect("lock acquired");
         let tx = lock.transaction()?;
@@ -308,11 +463,11 @@ impl SqliteStore {
         Ok(record)
     }
 
-    /// Lists active unexpired tokens.
+    /// Lists all unexpired tokens, newest first.
     ///
     /// # Errors
     ///
-    /// Returns a [`rusqlite::Error`] on database failure.
+    /// Returns an error if the query fails or any row cannot be decoded.
     pub fn list_tokens(&self) -> SqliteResult<Vec<TokenRecord>> {
         let lock = self.conn.lock().expect("lock acquired");
         let now = current_epoch_seconds();
@@ -330,22 +485,25 @@ impl SqliteStore {
         rows.collect()
     }
 
-    /// Deletes an enrollment token.
+    /// Deletes a token by hash.
+    ///
+    /// Returns `true` if a token was deleted.
     ///
     /// # Errors
     ///
-    /// Returns a [`rusqlite::Error`] on database failure.
+    /// Returns an error if the delete fails.
     pub fn revoke_token(&self, token_hash: &str) -> SqliteResult<bool> {
         let lock = self.conn.lock().expect("lock acquired");
         let deleted = lock.execute("DELETE FROM tokens WHERE token_hash = ?1", [token_hash])?;
         Ok(deleted > 0)
     }
 
-    /// Grants a client access to connect to an agent.
+    /// Grants `client_name` permission to connect to `agent_name`.
+    /// Granting an existing pair is a no-op.
     ///
     /// # Errors
     ///
-    /// Returns a [`rusqlite::Error`] on database failure.
+    /// Returns an error if the insert fails.
     pub fn add_grant(&self, client_name: &str, agent_name: &str) -> SqliteResult<()> {
         let lock = self.conn.lock().expect("lock acquired");
         let now = current_epoch_seconds();
@@ -356,11 +514,13 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// Removes a client authorization to reach an agent.
+    /// Removes the grant from `client_name` to `agent_name`.
+    ///
+    /// Returns `true` if a grant was removed.
     ///
     /// # Errors
     ///
-    /// Returns a [`rusqlite::Error`] on database failure.
+    /// Returns an error if the delete fails.
     pub fn remove_grant(&self, client_name: &str, agent_name: &str) -> SqliteResult<bool> {
         let lock = self.conn.lock().expect("lock acquired");
         let deleted = lock.execute(
@@ -370,11 +530,11 @@ impl SqliteStore {
         Ok(deleted > 0)
     }
 
-    /// Checks if a client is authorized to access an agent.
+    /// Reports whether `client_name` is granted access to `agent_name`.
     ///
     /// # Errors
     ///
-    /// Returns a [`rusqlite::Error`] on query failure.
+    /// Returns an error if the query fails.
     pub fn has_grant(&self, client_name: &str, agent_name: &str) -> SqliteResult<bool> {
         let lock = self.conn.lock().expect("lock acquired");
         let count: i64 = lock.query_row(
@@ -385,11 +545,12 @@ impl SqliteStore {
         Ok(count > 0)
     }
 
-    /// Lists granted agent names for a client.
+    /// Lists `(client_name, agent_name)` grants, optionally filtered to a
+    /// single client.
     ///
     /// # Errors
     ///
-    /// Returns a [`rusqlite::Error`] on query failure.
+    /// Returns an error if the query fails or any row cannot be decoded.
     pub fn list_grants(&self, client_name: Option<&str>) -> SqliteResult<Vec<(String, String)>> {
         let lock = self.conn.lock().expect("lock acquired");
         if let Some(client) = client_name {

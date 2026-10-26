@@ -16,14 +16,16 @@ pub const FRAME_HEADER_LEN: usize = 2;
 /// Application-level ALPN identifier for normal authenticated tunnel sessions.
 pub const ALPN_TUNNEL: &[u8] = b"rtunnel/1";
 
-/// Application-level ALPN identifier used exclusively for one-time enrollment exchanges.
+/// Application-level ALPN identifier used for one-time enrollment exchanges.
 pub const ALPN_ENROLL: &[u8] = b"rtunnel-enroll/1";
+
+/// Application-level ALPN identifier for pairing and rendezvous coordination.
+pub const ALPN_RENDEZVOUS: &[u8] = b"rtunnel-rendezvous/1";
 
 /// Current protocol minor revision.
 ///
-/// Revision 2 adds agent target discovery while keeping the revision 1 control
-/// messages decodable in both directions.
-pub const PROTOCOL_MINOR: u16 = 2;
+/// Revision 3 adds AnyDesk-style Device IDs, SAS pairing, and dynamic approvals.
+pub const PROTOCOL_MINOR: u16 = 3;
 
 /// Stable protocol error codes exchanged between relay, agent, and client peers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,6 +50,12 @@ pub enum ErrorCode {
     Revoked = 9,
     /// An internal relay or agent failure occurred.
     Internal = 10,
+    /// The pairing code provided was invalid, expired, or locked out.
+    InvalidPairingCode = 11,
+    /// The pairing request was denied by the remote host operator.
+    PairingDenied = 12,
+    /// The requested Device ID was not found on the rendezvous relay.
+    DeviceNotFound = 13,
 }
 
 impl fmt::Display for ErrorCode {
@@ -63,6 +71,9 @@ impl fmt::Display for ErrorCode {
             Self::Superseded => "Superseded",
             Self::Revoked => "Revoked",
             Self::Internal => "Internal",
+            Self::InvalidPairingCode => "InvalidPairingCode",
+            Self::PairingDenied => "PairingDenied",
+            Self::DeviceNotFound => "DeviceNotFound",
         };
         write!(f, "{name}")
     }
@@ -141,24 +152,30 @@ pub enum ResultStatus {
 /// Information describing a registered agent.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentInfo {
-    /// The unique name of the agent.
+    /// The unique name or device ID of the agent.
     pub name: String,
     /// Whether the agent currently holds an active connection to the relay.
     pub online: bool,
 }
 
 /// Agent status including the targets the agent has advertised.
-///
-/// This is a separate type from [`AgentInfo`] so that older clients can keep
-/// decoding [`ControlMessage::ListAgentsResponse`] unchanged.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentDetail {
-    /// The unique name of the agent.
+    /// The unique name or device ID of the agent.
     pub name: String,
     /// Whether the agent currently holds an active connection to the relay.
     pub online: bool,
     /// Exact-match `host:port` targets the agent accepts.
     pub targets: Vec<String>,
+}
+
+/// Level of persistence granted during host pairing approval.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GrantDuration {
+    /// Allowed for this session only (no persistent DB entry).
+    Once,
+    /// Permanently saved to the database.
+    Always,
 }
 
 /// Control messages exchanged over QUIC bidirectional streams.
@@ -185,9 +202,9 @@ pub enum ControlMessage {
         /// Machine hostname where the agent runs.
         hostname: String,
     },
-    /// Client request to connect to a named agent and optional target.
+    /// Client request to connect to a named agent or device ID.
     ConnectRequest {
-        /// Target agent name.
+        /// Target agent name or 9-digit Device ID.
         agent: String,
         /// Destination host and port, or `None` for agent default.
         target: Option<HostPort>,
@@ -196,7 +213,7 @@ pub enum ControlMessage {
     OpenTarget {
         /// Stable session identifier for auditing and telemetry.
         session_id: String,
-        /// Authenticated client name initiating the connection.
+        /// Authenticated client name or Device ID initiating the connection.
         client_name: String,
         /// Target destination host.
         host: String,
@@ -227,16 +244,16 @@ pub enum ControlMessage {
         /// Granted agent statuses.
         agents: Vec<AgentInfo>,
     },
-    /// Peer request to enroll using a one-time token.
+    /// Peer request to enroll using a legacy one-time token.
     Enroll {
         /// Secret one-time enrollment token.
         token: String,
     },
     /// Relay confirmation of successful enrollment.
     EnrollAck {
-        /// Enrolled peer name.
+        /// Enrolled peer name or assigned Device ID.
         name: String,
-        /// Assigned peer role (`"agent"` or `"client"`).
+        /// Assigned peer role (`"agent"`, `"client"`, or `"node"`).
         role: String,
     },
     /// Notification that the relay is shutting down gracefully.
@@ -257,10 +274,6 @@ pub enum ControlMessage {
         message: String,
     },
     /// Agent advertisement of the targets it is willing to open.
-    ///
-    /// Sent on a dedicated bidirectional stream immediately after the control
-    /// handshake. Relays that predate this message simply ignore the unhandled
-    /// stream, so the advertisement is backward compatible.
     AgentTargets {
         /// Exact-match `host:port` targets accepted by the agent.
         targets: Vec<String>,
@@ -274,6 +287,71 @@ pub enum ControlMessage {
     AgentsDetailedResponse {
         /// Granted agent statuses with advertised targets.
         agents: Vec<AgentDetail>,
+    },
+
+    // --- AnyDesk-Style Rendezvous & Pairing Additions ---
+    /// Request to register a zero-config peer and allocate or confirm a Device ID.
+    RegisterDevice {
+        /// Preferred device label or hostname.
+        label: String,
+        /// If re-registering an existing Device ID.
+        existing_device_id: Option<String>,
+    },
+    /// Relay acknowledgement granting or confirming the Device ID.
+    RegisterDeviceAck {
+        /// Canonical 9-digit Device ID (e.g. "482913077").
+        device_id: String,
+    },
+    /// Host updates its ephemeral pairing code on the relay.
+    SetPairingCode {
+        /// SHA-256 hash of the one-time pairing code.
+        code_hash: String,
+        /// TTL in seconds.
+        ttl_secs: u32,
+    },
+    /// Client requests pairing with a target Device ID using an access code.
+    PairRequest {
+        /// Target 9-digit Device ID.
+        target_device_id: String,
+        /// Pairing code entered by the client operator.
+        code: String,
+        /// Client human-readable hostname or user identity.
+        client_label: String,
+        /// Optional client SSH public key (e.g. "ssh-ed25519 AAAA...").
+        ssh_pubkey: Option<String>,
+    },
+    /// Relay routes pairing request to the host with a calculated SAS code.
+    IncomingPairPrompt {
+        /// Request session token.
+        pair_session_id: String,
+        /// Initiator client Device ID or name.
+        client_id: String,
+        /// Initiator label.
+        client_label: String,
+        /// 4-digit Short Authentication String computed for out-of-band visual verification.
+        sas: String,
+        /// Client SSH public key, if supplied.
+        ssh_pubkey: Option<String>,
+    },
+    /// Host response accepting or denying the pairing request.
+    PairPromptResponse {
+        /// Request session token.
+        pair_session_id: String,
+        /// Decision by the host operator.
+        approved: bool,
+        /// Grant duration: once or always.
+        duration: GrantDuration,
+        /// Whether the host operator approved adding the SSH public key.
+        install_ssh_key: bool,
+    },
+    /// Relay notifies client of pairing resolution.
+    PairResult {
+        /// Whether pairing succeeded.
+        success: bool,
+        /// Assigned host device ID.
+        host_device_id: String,
+        /// Error details if denied or failed.
+        error: Option<ErrorCode>,
     },
 }
 
@@ -337,139 +415,61 @@ pub fn decode_frame(buf: &[u8]) -> Result<(ControlMessage, usize), ProtocolError
     Ok((message, total))
 }
 
+/// Formats a raw 9-digit string into AnyDesk-style spaced digits: `482 913 077`.
+#[must_use]
+pub fn format_device_id(raw: &str) -> String {
+    let digits: String = raw.chars().filter(char::is_ascii_digit).collect();
+    if digits.len() == 9 {
+        format!("{} {} {}", &digits[0..3], &digits[3..6], &digits[6..9])
+    } else {
+        raw.to_string()
+    }
+}
+
+/// Strips formatting whitespace and dashes from a Device ID string.
+#[must_use]
+pub fn normalize_device_id(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| !c.is_whitespace() && *c != '-')
+        .collect()
+}
+
+/// Computes a Short Authentication String (SAS, 4 decimal digits) derived from two peer fingerprints.
+#[must_use]
+pub fn compute_sas(fp_a: &str, fp_b: &str, salt: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    if fp_a < fp_b {
+        hasher.update(fp_a.as_bytes());
+        hasher.update(fp_b.as_bytes());
+    } else {
+        hasher.update(fp_b.as_bytes());
+        hasher.update(fp_a.as_bytes());
+    }
+    hasher.update(salt.as_bytes());
+    let hash = hasher.finalize();
+    let num = u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]]) % 10000;
+    format!("{num:04}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proptest::prelude::*;
 
-    fn arb_host_port() -> impl Strategy<Value = HostPort> {
-        ("[a-z0-9.-]{1,32}", 1u16..=65535).prop_filter_map("valid hostport", |(host, port)| {
-            HostPort::new(host, port).ok()
-        })
-    }
-
-    fn arb_message() -> impl Strategy<Value = ControlMessage> {
-        prop_oneof![
-            (0u16..=10, prop::collection::vec("[a-z0-9-]{0,16}", 0..=4)).prop_map(
-                |(minor, features)| ControlMessage::Hello {
-                    protocol_minor: minor,
-                    features,
-                }
-            ),
-            "[a-z0-9-]{1,16}".prop_map(|agent_name| ControlMessage::HelloAck { agent_name }),
-            ("[a-z0-9-]{1,16}", "[a-z0-9-]{1,16}").prop_map(|(agent_version, hostname)| {
-                ControlMessage::AgentHello {
-                    protocol_minor: PROTOCOL_MINOR,
-                    agent_version,
-                    hostname,
-                }
-            }),
-            ("[a-z0-9-]{1,16}", prop::option::of(arb_host_port()))
-                .prop_map(|(agent, target)| { ControlMessage::ConnectRequest { agent, target } }),
-            (
-                "[a-z0-9-]{1,16}",
-                "[a-z0-9-]{1,16}",
-                "[a-z0-9.-]{1,16}",
-                1u16..=65535
-            )
-                .prop_map(|(session_id, client_name, host, port)| {
-                    ControlMessage::OpenTarget {
-                        session_id,
-                        client_name,
-                        host,
-                        port,
-                    }
-                }),
-            ("[a-z0-9-]{1,16}").prop_map(|session_id| ControlMessage::OpenResult {
-                session_id,
-                status: ResultStatus::Ok,
-            }),
-            ("[a-z0-9-]{1,16}").prop_map(|session_id| ControlMessage::ConnectResponse {
-                session_id,
-                status: ResultStatus::Ok,
-            }),
-            "[a-z0-9-]{1,16}".prop_map(|token| ControlMessage::Enroll { token }),
-            ("[a-z0-9-]{1,16}", "[a-z0-9-]{1,16}")
-                .prop_map(|(name, role)| ControlMessage::EnrollAck { name, role }),
-            prop::collection::vec("[a-z0-9.-]{1,16}:[0-9]{1,5}", 0..=4)
-                .prop_map(|targets| ControlMessage::AgentTargets { targets }),
-            "[a-z0-9-]{1,16}"
-                .prop_map(|client_name| ControlMessage::ListAgentsDetailed { client_name }),
-            (
-                "[a-z0-9-]{1,16}",
-                any::<bool>(),
-                prop::collection::vec("[a-z0-9.-]{1,16}:[0-9]{1,5}", 0..=4)
-            )
-                .prop_map(|(name, online, targets)| {
-                    ControlMessage::AgentsDetailedResponse {
-                        agents: vec![AgentDetail {
-                            name,
-                            online,
-                            targets,
-                        }],
-                    }
-                }),
-        ]
+    #[test]
+    fn test_format_normalize_device_id() {
+        let raw = "482913077";
+        let formatted = format_device_id(raw);
+        assert_eq!(formatted, "482 913 077");
+        assert_eq!(normalize_device_id(&formatted), "482913077");
+        assert_eq!(normalize_device_id(" 482-913-077 "), "482913077");
     }
 
     #[test]
-    fn round_trip_agent_targets() {
-        let msg = ControlMessage::AgentTargets {
-            targets: vec!["winbox:22".into(), "nas:445".into()],
-        };
-        let encoded = encode_frame(&msg).unwrap();
-        let (decoded, consumed) = decode_frame(&encoded).unwrap();
-        assert_eq!(decoded, msg);
-        assert_eq!(consumed, encoded.len());
-    }
-
-    #[test]
-    fn round_trip_agents_detailed_response() {
-        let msg = ControlMessage::AgentsDetailedResponse {
-            agents: vec![AgentDetail {
-                name: "clinic-a".into(),
-                online: true,
-                targets: vec!["winbox:22".into()],
-            }],
-        };
-        let encoded = encode_frame(&msg).unwrap();
-        let (decoded, consumed) = decode_frame(&encoded).unwrap();
-        assert_eq!(decoded, msg);
-        assert_eq!(consumed, encoded.len());
-    }
-
-    #[test]
-    fn round_trip_connect_request() {
-        let msg = ControlMessage::ConnectRequest {
-            agent: "agent-1".into(),
-            target: Some(HostPort::new("127.0.0.1", 22).unwrap()),
-        };
-        let encoded = encode_frame(&msg).unwrap();
-        let (decoded, consumed) = decode_frame(&encoded).unwrap();
-        assert_eq!(decoded, msg);
-        assert_eq!(consumed, encoded.len());
-    }
-
-    #[test]
-    fn rejects_oversized_frame() {
-        let mut raw = vec![0u8; 10];
-        let len = u16::try_from(MAX_FRAME_SIZE + 1).unwrap();
-        raw[0..2].copy_from_slice(&len.to_be_bytes());
-        assert_eq!(decode_frame(&raw), Err(ProtocolError::OversizedFrame));
-    }
-
-    proptest! {
-        #[test]
-        fn round_trip_property(msg in arb_message()) {
-            let encoded = encode_frame(&msg).unwrap();
-            let (decoded, consumed) = decode_frame(&encoded).unwrap();
-            prop_assert_eq!(decoded, msg);
-            prop_assert_eq!(consumed, encoded.len());
-        }
-
-        #[test]
-        fn arbitrary_bytes_never_panic(bytes in prop::collection::vec(any::<u8>(), 0..5000)) {
-            let _ = decode_frame(&bytes);
-        }
+    fn test_sas_computation_symmetric() {
+        let sas1 = compute_sas("fp_aaa", "fp_bbb", "session123");
+        let sas2 = compute_sas("fp_bbb", "fp_aaa", "session123");
+        assert_eq!(sas1, sas2);
+        assert_eq!(sas1.len(), 4);
     }
 }

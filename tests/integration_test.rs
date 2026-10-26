@@ -573,3 +573,58 @@ async fn test_half_close_preservation() {
     let end = recv.read(&mut tail).await.unwrap();
     assert_eq!(end, None);
 }
+
+#[tokio::test]
+async fn test_anydesk_zero_config_setup_and_pairing() {
+    let harness = TestHarness::start();
+
+    // 1. Peer A (Host) and Peer B (Client) generate keys locally
+    let host_id = generate_identity("node-host").unwrap();
+    let client_id = generate_identity("node-client").unwrap();
+
+    // 2. Both register on the rendezvous relay to get 9-digit Device IDs
+    let host_device_id = harness
+        .store
+        .get_or_allocate_device_id(&host_id.fingerprint, "host-pc")
+        .unwrap();
+
+    let client_device_id = harness
+        .store
+        .get_or_allocate_device_id(&client_id.fingerprint, "client-pc")
+        .unwrap();
+
+    assert_eq!(host_device_id.len(), 9);
+    assert_eq!(client_device_id.len(), 9);
+
+    // 3. Host sets a one-time pairing access code: "492184"
+    let code = "492184";
+    let code_hash = rtunnel_identity::hex_encode(&Sha256::digest(code.as_bytes()));
+    harness
+        .store
+        .set_pairing_code(&host_device_id, &code_hash, 300)
+        .unwrap();
+
+    // 4. Client attempts pairing with correct code
+    let valid = harness
+        .store
+        .verify_pairing_code(&host_device_id, &code_hash)
+        .unwrap();
+    assert!(valid, "Valid pairing code must verify");
+
+    // 5. Compute SAS for visual verification
+    let sas =
+        rtunnel_proto::compute_sas(&host_id.fingerprint, &client_id.fingerprint, "session-test");
+    assert_eq!(sas.len(), 4);
+
+    // 6. Host grants permission to Client
+    harness
+        .store
+        .add_grant(&client_device_id, &host_device_id)
+        .unwrap();
+    assert!(
+        harness
+            .store
+            .has_grant(&client_device_id, &host_device_id)
+            .unwrap()
+    );
+}

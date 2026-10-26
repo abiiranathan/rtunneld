@@ -42,19 +42,18 @@ pub fn is_root() -> bool {
     }
 }
 
-/// Returns an error unless the process runs as root.
+/// Returns an error unless the process runs as root or administrator.
 ///
 /// # Errors
 ///
-/// Returns [`io::ErrorKind::PermissionDenied`] when the effective user is not
-/// root.
+/// Returns [`io::ErrorKind::PermissionDenied`] when the effective user is not root.
 pub fn ensure_root() -> io::Result<()> {
     if is_root() {
         Ok(())
     } else {
         Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "this command must run as root (try sudo)",
+            "this command must run as root or administrator (try sudo)",
         ))
     }
 }
@@ -152,6 +151,7 @@ pub fn add_to_user_path(dir: &Path) -> io::Result<bool> {
 ///
 /// Never returns an error on non-Windows platforms.
 #[cfg(not(windows))]
+#[allow(clippy::unnecessary_wraps)]
 pub fn add_to_user_path(_dir: &Path) -> io::Result<bool> {
     Ok(false)
 }
@@ -160,8 +160,6 @@ fn normalize_path_entry(entry: &OsStr) -> String {
     let text = entry.to_string_lossy();
     let text = text.trim().trim_matches('"');
     let trimmed = text.trim_end_matches(['/', '\\']);
-    // Preserve a bare root such as `/` or `\` instead of normalizing it to an
-    // empty string, which would match empty `PATH` entries.
     let text = if trimmed.is_empty() { text } else { trimmed };
     if cfg!(windows) {
         text.to_ascii_lowercase()
@@ -242,6 +240,125 @@ pub fn install_self(dest: &Path) -> io::Result<PathBuf> {
     Ok(dest)
 }
 
+/// Installs and enables the background service across Linux (`systemd`), macOS (`launchd`), and Windows (`sc.exe`).
+///
+/// # Errors
+///
+/// Returns an error if generating, writing, or registering the service fails with the platform supervisor.
+pub fn install_service(
+    service_name: &str,
+    bin_path: &Path,
+    args: &[&str],
+    _state_dir: &Path,
+) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let exec_cmd = format!("{} {}", bin_path.display(), args.join(" "));
+        let template = r"[Unit]
+Description=rtunnel background host daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=__EXEC_CMD__
+Restart=always
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+";
+        let contents = template.replace("__EXEC_CMD__", &exec_cmd);
+        let unit_filename = format!("{service_name}.service");
+        install_unit(&unit_filename, &contents)?;
+        enable_service(&unit_filename, true)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let plist_path = PathBuf::from(format!(
+            "/Library/LaunchDaemons/com.rtunnel.{service_name}.plist"
+        ));
+        let mut program_args = vec![bin_path.to_string_lossy().into_owned()];
+        program_args.extend(args.iter().map(|&a| a.to_string()));
+        let args_xml = program_args
+            .iter()
+            .map(|arg| format!("        <string>{arg}</string>"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let plist_content = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.rtunnel.{service_name}</string>
+    <key>ProgramArguments</key>
+    <array>
+{args_xml}
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardErrorPath</key>
+    <string>{}/daemon.log</string>
+</dict>
+</plist>
+"#,
+            state_dir.display()
+        );
+
+        fs::write(&plist_path, plist_content)?;
+        set_mode(&plist_path, 0o644)?;
+        let output = Command::new("launchctl")
+            .args(["load", "-w", &plist_path.to_string_lossy()])
+            .output()?;
+        if !output.status.success() {
+            return Err(io::Error::other(format!(
+                "launchctl load failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    {
+        let bin_args = format!("{} {}", bin_path.display(), args.join(" "));
+        let status = Command::new("sc.exe")
+            .args([
+                "create",
+                service_name,
+                &format!("binPath= {bin_args}"),
+                "start= auto",
+            ])
+            .status()?;
+        if !status.success() {
+            return Err(io::Error::other("sc.exe create service failed"));
+        }
+        let start_status = Command::new("sc.exe")
+            .args(["start", service_name])
+            .status()?;
+        if !start_status.success() {
+            return Err(io::Error::other("sc.exe start service failed"));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        let _ = (service_name, bin_path, args, state_dir);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "platform service manager not supported",
+        ))
+    }
+}
+
 /// Writes a systemd unit to [`DEFAULT_SYSTEMD_DIR`].
 ///
 /// # Errors
@@ -305,8 +422,6 @@ pub fn render_unit(template: &str, exec_start: &str, state_dir: &Path) -> String
         }
     }
 
-    // The embedded templates always contain ExecStart, but keep the renderer
-    // useful for callers that pass a minimal template.
     if !replaced_exec_start {
         rendered.push_str("ExecStart=");
         rendered.push_str(exec_start);
@@ -444,6 +559,39 @@ pub fn ssh_include_line(home: &Path) -> String {
     }
 }
 
+/// Securely appends an SSH public key to the user's `~/.ssh/authorized_keys` file.
+///
+/// # Errors
+///
+/// Returns an error if creating the `.ssh` directory, reading, or writing `authorized_keys` fails.
+pub fn append_authorized_key(home: &Path, pubkey: &str) -> io::Result<()> {
+    let ssh_dir = home.join(".ssh");
+    create_private_dir(&ssh_dir)?;
+    let auth_keys = ssh_dir.join("authorized_keys");
+
+    let current = if auth_keys.exists() {
+        fs::read_to_string(&auth_keys)?
+    } else {
+        String::new()
+    };
+
+    let trimmed = pubkey.trim();
+    if trimmed.is_empty() || current.lines().any(|l| l.trim() == trimmed) {
+        return Ok(());
+    }
+
+    let mut updated = current;
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str(trimmed);
+    updated.push('\n');
+
+    fs::write(&auth_keys, updated)?;
+    set_mode(&auth_keys, 0o600)?;
+    Ok(())
+}
+
 fn absolute_path(path: &Path) -> io::Result<PathBuf> {
     if path.is_absolute() {
         Ok(path.to_path_buf())
@@ -478,9 +626,6 @@ fn replace_file(temporary: &Path, dest: &Path) -> io::Result<()> {
     match fs::rename(temporary, dest) {
         Ok(()) => Ok(()),
         Err(error) => {
-            // Windows refuses to rename over an existing file. Removing first
-            // is also the best effort on Unix for filesystems that reject
-            // atomic replacement.
             if dest.exists() {
                 fs::remove_file(dest)?;
                 fs::rename(temporary, dest)
@@ -522,8 +667,8 @@ fn set_mode(_path: &Path, _mode: u32) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        configure_ssh_include, executable_name, install_self, path_contains, render_unit,
-        ssh_include_line,
+        append_authorized_key, configure_ssh_include, executable_name, install_self, path_contains,
+        render_unit, ssh_include_line,
     };
     use std::ffi::OsStr;
     use std::fs;
@@ -579,6 +724,19 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn appends_authorized_key_once() {
+        let home = tempfile::tempdir().expect("temporary home directory");
+        let sample_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIG... user@host";
+
+        append_authorized_key(home.path(), sample_key).expect("append key first time");
+        append_authorized_key(home.path(), sample_key).expect("append key duplicate");
+
+        let auth_file = home.path().join(".ssh/authorized_keys");
+        let content = fs::read_to_string(auth_file).expect("read authorized_keys");
+        assert_eq!(content.lines().filter(|l| *l == sample_key).count(), 1);
     }
 
     #[test]

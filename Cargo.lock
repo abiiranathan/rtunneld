@@ -1170,12 +1170,14 @@ dependencies = [
  "clap",
  "directories",
  "quinn",
+ "rand 0.8.8",
  "rtunnel-identity",
  "rtunnel-install",
  "rtunnel-proto",
  "rtunnel-transport",
  "rustls",
  "serde",
+ "sha2",
  "thiserror 2.0.21",
  "tokio",
  "toml",
@@ -1235,6 +1237,7 @@ dependencies = [
  "postcard",
  "proptest",
  "serde",
+ "sha2",
  "thiserror 2.0.21",
 ]
 
