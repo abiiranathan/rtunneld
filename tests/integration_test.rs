@@ -4,16 +4,44 @@ use rtunnel_agent::{AgentConfig, AgentRunner};
 use rtunnel_identity::{
     EnrollmentUri, KeyMaterial, PinnedServerVerifier, generate_identity, save_identity,
 };
-use rtunnel_proto::{ALPN_ENROLL, ALPN_TUNNEL, ControlMessage, ErrorCode, HostPort, ResultStatus};
+use rtunnel_proto::{
+    ALPN_ENROLL, ALPN_RENDEZVOUS, ALPN_TUNNEL, ControlMessage, ErrorCode, HostPort, ResultStatus,
+};
 use rtunnel_relay::{AuditLogger, RelayServer, SqliteStore};
 use rtunnel_transport::{create_client_endpoint, make_client_config, read_frame, write_frame};
 use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
+
+/// Dynamically resolves the `rtunnel` binary across workspace packages and target profiles.
+fn rtunnel_binary_path() -> PathBuf {
+    if let Ok(var) = std::env::var("CARGO_BIN_EXE_rtunnel") {
+        let p = PathBuf::from(var);
+        if p.exists() {
+            return p;
+        }
+    }
+    let mut path = std::env::current_exe().expect("cannot determine test executable path");
+    path.pop(); // pop test exe name
+    if path.file_name().and_then(|s| s.to_str()) == Some("deps") {
+        path.pop(); // pop deps/
+    }
+    #[cfg(windows)]
+    path.push("rtunnel.exe");
+    #[cfg(not(windows))]
+    path.push("rtunnel");
+
+    if path.exists() {
+        path
+    } else {
+        assert_cmd::cargo::cargo_bin("rtunnel")
+    }
+}
 
 struct TestHarness {
     relay_addr: SocketAddr,
@@ -24,8 +52,6 @@ struct TestHarness {
 }
 
 impl TestHarness {
-    // Not `async`: nothing is awaited here. The relay's run loop is spawned
-    // onto the ambient tokio runtime, which every `#[tokio::test]` provides.
     fn start() -> Self {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let temp_dir = tempfile::tempdir().unwrap();
@@ -64,8 +90,6 @@ impl TestHarness {
     fn make_token(&self, name: &str, role: &str) -> (String, EnrollmentUri) {
         let token = format!("token-{}", rand::random::<u64>());
         let token_hash = rtunnel_identity::hex_encode(&Sha256::digest(token.as_bytes()));
-        // A Unix timestamp plus ten minutes cannot exceed i64::MAX, so the
-        // sign reinterpretation is lossless.
         let expires_at = (std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -155,7 +179,6 @@ async fn test_full_tunnel_data_transfer_and_hash_integrity() {
     tokio::spawn(AgentRunner::new(agent_cfg, agent_id).run());
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Connect client
     let endpoint = create_client_endpoint("0.0.0.0:0".parse().unwrap()).unwrap();
     let verifier = Arc::new(PinnedServerVerifier::new(
         &harness.relay_identity.fingerprint,
@@ -197,8 +220,6 @@ async fn test_full_tunnel_data_transfer_and_hash_integrity() {
         }
     );
 
-    // Stream 1 MiB of patterned data through the tunnel and verify SHA-256 integrity.
-    // The pattern repeats 0..=250, which avoids a lossy usize -> u8 cast.
     let data_size = 1024 * 1024;
     let payload: Vec<u8> = (0..=250_u8).cycle().take(data_size).collect();
     let expected_hash = Sha256::digest(&payload);
@@ -227,7 +248,6 @@ async fn test_unauthorized_client_rejected() {
     let harness = TestHarness::start();
     let agent_id = harness.enroll_peer("agent-2", "agent").await;
     let client_id = harness.enroll_peer("client-unauthorized", "client").await;
-    // Note: No grant added between client-unauthorized and agent-2
 
     let agent_cfg = AgentConfig {
         relay_host: harness.relay_addr.ip().to_string(),
@@ -323,7 +343,6 @@ async fn test_disallowed_target_rejected_by_agent() {
         .unwrap();
 
     let (mut send, mut recv) = conn.open_bi().await.unwrap();
-    // Request destination 127.0.0.1:9999 which is NOT in agent-3 allowed targets
     write_frame(
         &mut send,
         &ControlMessage::ConnectRequest {
@@ -427,7 +446,6 @@ async fn test_revocation_terminates_agent_live_session() {
     tokio::spawn(AgentRunner::new(agent_cfg, agent_id).run());
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // A granted client observes the relay's live agent registry via ListAgents.
     let endpoint = create_client_endpoint("0.0.0.0:0".parse().unwrap()).unwrap();
     let verifier = Arc::new(PinnedServerVerifier::new(
         &harness.relay_identity.fingerprint,
@@ -450,8 +468,6 @@ async fn test_revocation_terminates_agent_live_session() {
         .await
         .unwrap();
 
-    // Each query uses a fresh bidirectional stream on the same client connection.
-    // A closure (rather than a helper fn) avoids naming quinn's connection type here.
     let conn_ref = &conn;
     let agent_is_online = || async move {
         let (mut send, mut recv) = conn_ref.open_bi().await.unwrap();
@@ -474,20 +490,15 @@ async fn test_revocation_terminates_agent_live_session() {
             .online
     };
 
-    // Precondition: the agent is registered and live before revocation.
     assert!(
         agent_is_online().await,
         "agent should be online before revocation"
     );
 
-    // Revoke the agent in the SQLite store.
     assert!(harness.store.revoke_peer("agent-rev").unwrap());
 
-    // The revocation watcher on the relay polls once per second and terminates live
-    // connections. The agent's reconnect attempts are rejected because it is revoked.
     tokio::time::sleep(Duration::from_millis(2500)).await;
 
-    // The relay itself must have dropped the live session, not merely the store flag.
     assert!(
         !agent_is_online().await,
         "relay should have dropped the revoked agent's live connection"
@@ -559,16 +570,13 @@ async fn test_half_close_preservation() {
         }
     ));
 
-    // Send payload and close write direction (FIN)
     send.write_all(b"ping half close").await.unwrap();
     send.finish().unwrap();
 
-    // The other direction must continue flowing until all echoed bytes are delivered
     let mut echo_buf = vec![0u8; 15];
     recv.read_exact(&mut echo_buf).await.unwrap();
     assert_eq!(&echo_buf, b"ping half close");
 
-    // The recv stream should report EOF cleanly
     let mut tail = [0u8; 1];
     let end = recv.read(&mut tail).await.unwrap();
     assert_eq!(end, None);
@@ -578,11 +586,9 @@ async fn test_half_close_preservation() {
 async fn test_anydesk_zero_config_setup_and_pairing() {
     let harness = TestHarness::start();
 
-    // 1. Peer A (Host) and Peer B (Client) generate keys locally
     let host_id = generate_identity("node-host").unwrap();
     let client_id = generate_identity("node-client").unwrap();
 
-    // 2. Both register on the rendezvous relay to get 9-digit Device IDs
     let host_device_id = harness
         .store
         .get_or_allocate_device_id(&host_id.fingerprint, "host-pc")
@@ -596,7 +602,6 @@ async fn test_anydesk_zero_config_setup_and_pairing() {
     assert_eq!(host_device_id.len(), 9);
     assert_eq!(client_device_id.len(), 9);
 
-    // 3. Host sets a one-time pairing access code: "492184"
     let code = "492184";
     let code_hash = rtunnel_identity::hex_encode(&Sha256::digest(code.as_bytes()));
     harness
@@ -604,19 +609,16 @@ async fn test_anydesk_zero_config_setup_and_pairing() {
         .set_pairing_code(&host_device_id, &code_hash, 300)
         .unwrap();
 
-    // 4. Client attempts pairing with correct code
     let valid = harness
         .store
         .verify_pairing_code(&host_device_id, &code_hash)
         .unwrap();
     assert!(valid, "Valid pairing code must verify");
 
-    // 5. Compute SAS for visual verification
     let sas =
         rtunnel_proto::compute_sas(&host_id.fingerprint, &client_id.fingerprint, "session-test");
     assert_eq!(sas.len(), 4);
 
-    // 6. Host grants permission to Client
     harness
         .store
         .add_grant(&client_device_id, &host_device_id)
@@ -626,5 +628,140 @@ async fn test_anydesk_zero_config_setup_and_pairing() {
             .store
             .has_grant(&client_device_id, &host_device_id)
             .unwrap()
+    );
+}
+
+/// Verifies that the client binary exposes a working `install` subcommand as
+/// called by `scripts/install.ps1` and `scripts/install.sh`.
+#[test]
+fn test_client_cli_install_subcommand() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let bin_dir = temp_dir.path().join("bin");
+
+    let binary_path = rtunnel_binary_path();
+
+    let status = std::process::Command::new(&binary_path)
+        .args([
+            "install",
+            "--bin-dir",
+            bin_dir.to_str().unwrap(),
+            "--no-path",
+            "--no-ssh-config",
+            "--no-ssh-hosts",
+        ])
+        .status()
+        .expect("failed to execute rtunnel install");
+
+    assert!(
+        status.success(),
+        "rtunnel install must succeed with exit code 0"
+    );
+
+    #[cfg(windows)]
+    let installed_binary = bin_dir.join("rtunnel.exe");
+    #[cfg(not(windows))]
+    let installed_binary = bin_dir.join("rtunnel");
+
+    assert!(
+        installed_binary.exists(),
+        "installed binary must exist at {}",
+        installed_binary.display()
+    );
+
+    let help_status = std::process::Command::new(&installed_binary)
+        .arg("--help")
+        .output()
+        .expect("installed binary must execute");
+    assert!(help_status.status.success());
+    let help_text = String::from_utf8_lossy(&help_status.stdout);
+    assert!(help_text.contains("rtunnel"));
+}
+
+/// Verifies dynamic device ID allocation over QUIC with `ALPN_RENDEZVOUS`.
+#[tokio::test]
+async fn test_rendezvous_register_device_over_quic() {
+    let harness = TestHarness::start();
+    let peer_id = generate_identity("test-node").unwrap();
+
+    let endpoint = create_client_endpoint("0.0.0.0:0".parse().unwrap()).unwrap();
+    let verifier = Arc::new(PinnedServerVerifier::new(
+        &harness.relay_identity.fingerprint,
+    ));
+    let client_config = make_client_config(
+        &peer_id.certificate_der,
+        &peer_id.private_key_pem,
+        verifier,
+        vec![ALPN_RENDEZVOUS.to_vec()],
+    )
+    .unwrap();
+
+    let conn = endpoint
+        .connect_with(
+            client_config,
+            harness.relay_addr,
+            &harness.relay_addr.ip().to_string(),
+        )
+        .unwrap()
+        .await
+        .unwrap();
+
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    write_frame(
+        &mut send,
+        &ControlMessage::RegisterDevice {
+            label: "my-workstation".into(),
+            existing_device_id: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let resp = read_frame(&mut recv).await.unwrap();
+    match resp {
+        ControlMessage::RegisterDeviceAck { device_id } => {
+            assert_eq!(device_id.len(), 9, "Allocated Device ID must be 9 digits");
+            assert!(
+                device_id.chars().all(|c| c.is_ascii_digit()),
+                "Device ID must consist only of ASCII digits"
+            );
+        }
+        other => panic!("expected RegisterDeviceAck, got {other:?}"),
+    }
+}
+
+/// Verifies that 5 incorrect pairing attempts trigger progressive lockout.
+#[tokio::test]
+async fn test_anydesk_pairing_code_lockout_after_failures() {
+    let harness = TestHarness::start();
+    let host_id = generate_identity("node-lockout-host").unwrap();
+    let host_device_id = harness
+        .store
+        .get_or_allocate_device_id(&host_id.fingerprint, "host-pc")
+        .unwrap();
+
+    let correct_code = "777888";
+    let correct_hash = rtunnel_identity::hex_encode(&Sha256::digest(correct_code.as_bytes()));
+    harness
+        .store
+        .set_pairing_code(&host_device_id, &correct_hash, 300)
+        .unwrap();
+
+    let wrong_hash = rtunnel_identity::hex_encode(&Sha256::digest(b"wrong-code"));
+
+    for _ in 0..5 {
+        let valid = harness
+            .store
+            .verify_pairing_code(&host_device_id, &wrong_hash)
+            .unwrap();
+        assert!(!valid, "Wrong pairing code must fail verification");
+    }
+
+    let valid_after_lockout = harness
+        .store
+        .verify_pairing_code(&host_device_id, &correct_hash)
+        .unwrap();
+    assert!(
+        !valid_after_lockout,
+        "Pairing code must be locked out after 5 consecutive failures"
     );
 }

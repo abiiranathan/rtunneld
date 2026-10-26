@@ -10,16 +10,18 @@ use quinn::Connection;
 use rand::Rng;
 use rtunnel_client::ClientConfig;
 use rtunnel_identity::{
-    KeyMaterial, PinnedServerVerifier, generate_identity, load_identity, save_identity,
+    EnrollmentUri, KeyMaterial, PinnedServerVerifier, generate_identity, is_valid_name,
+    load_identity, save_identity,
 };
 use rtunnel_proto::{
-    ALPN_RENDEZVOUS, ALPN_TUNNEL, ControlMessage, ErrorCode, GrantDuration, HostPort, ResultStatus,
-    format_device_id, normalize_device_id,
+    ALPN_ENROLL, ALPN_RENDEZVOUS, ALPN_TUNNEL, AgentDetail, ControlMessage, ErrorCode,
+    GrantDuration, HostPort, ResultStatus, format_device_id, normalize_device_id,
 };
 use rtunnel_transport::{
     create_client_endpoint, make_client_config, read_frame, splice_quic_to_stdio, write_frame,
 };
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::io::{BufRead, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -71,24 +73,43 @@ enum Command {
     },
     /// Run the background host service for this device.
     Host,
-    /// Install this binary as a persistent system background service (systemd/launchd/Windows).
+    /// Manage the background system service (systemd/launchd/Windows Service).
     Service {
         #[command(subcommand)]
         action: ServiceCommand,
     },
-    /// Legacy token enrollment URI.
-    Enroll { uri: String },
+    /// Install this binary, configure OpenSSH, and optionally enroll.
+    Install {
+        /// Optional enrollment URI; the client is enrolled after installation.
+        uri: Option<String>,
+        /// Directory to install into. Defaults to `/usr/local/bin` for root,
+        /// `~/.local/bin` for other Unix users, and
+        /// `%LOCALAPPDATA%\Programs\rtunnel` on Windows.
+        #[arg(long)]
+        bin_dir: Option<PathBuf>,
+        /// Do not add the rtunnel snippet directory to `~/.ssh/config`.
+        #[arg(long)]
+        no_ssh_config: bool,
+        /// Do not create OpenSSH host entries for granted agents after enrolling.
+        #[arg(long)]
+        no_ssh_hosts: bool,
+        /// Do not add the install directory to the user `PATH` (Windows).
+        #[arg(long)]
+        no_path: bool,
+    },
+    /// Enroll this client using a one-time token URI.
+    Enroll {
+        /// Enrollment URI of the form `rtunnel://<host>:<port>/?fp=<fingerprint>&token=<token>`.
+        uri: String,
+    },
     /// Query relay for accessible devices.
     Agents,
     /// Generate OpenSSH host config blocks.
     SshConfig {
         agent: Option<String>,
-        /// Optional destination host:port on the agent LAN.
         target: Option<String>,
-        /// Write the snippet to `~/.ssh/rtunnel.d/<agent>.conf` instead of stdout.
         #[arg(long)]
         write: bool,
-        /// Write snippets for every agent granted to this client.
         #[arg(long)]
         all: bool,
     },
@@ -131,8 +152,9 @@ fn default_state_dir() -> PathBuf {
 
 fn load_client_state(state_dir: &Path) -> Result<(ClientConfig, KeyMaterial)> {
     let config = ClientConfig::load(state_dir)
-        .context("configuration missing; run 'rtunnel setup' first")?;
-    let id = load_identity(state_dir).context("identity key missing; run 'rtunnel setup' first")?;
+        .context("client configuration missing; run 'rtunnel setup' or 'rtunnel enroll' first")?;
+    let id = load_identity(state_dir)
+        .context("client identity key missing; run 'rtunnel setup' or 'rtunnel enroll' first")?;
     Ok((config, id))
 }
 
@@ -163,7 +185,152 @@ async fn dial_relay(
         .context("relay TLS/QUIC handshake failed")
 }
 
-/// Interactive first-time setup for painless AnyDesk-style onboarding.
+fn default_client_bin_dir() -> Result<PathBuf> {
+    #[cfg(windows)]
+    {
+        let dirs = BaseDirs::new().context("cannot determine home directory")?;
+        Ok(dirs.data_local_dir().join("Programs").join("rtunnel"))
+    }
+
+    #[cfg(not(windows))]
+    {
+        if rtunnel_install::is_root() {
+            return Ok(PathBuf::from(rtunnel_install::DEFAULT_BIN_DIR));
+        }
+        let dirs = BaseDirs::new().context("cannot determine home directory")?;
+        Ok(dirs.home_dir().join(".local").join("bin"))
+    }
+}
+
+async fn install_client(
+    state_dir: &Path,
+    uri: Option<&str>,
+    bin_dir: Option<PathBuf>,
+    no_ssh_config: bool,
+    no_ssh_hosts: bool,
+    no_path: bool,
+) -> Result<()> {
+    let bin_dir = match bin_dir {
+        Some(dir) => dir,
+        None => default_client_bin_dir()?,
+    };
+    let bin_path = bin_dir.join(rtunnel_install::executable_name("rtunnel"));
+    let installed = rtunnel_install::install_self(&bin_path)
+        .with_context(|| format!("failed to install {}", bin_path.display()))?;
+    println!("Installed rtunnel at {}", installed.display());
+
+    if !no_ssh_config {
+        let home = BaseDirs::new()
+            .map(|dirs| dirs.home_dir().to_path_buf())
+            .context("cannot determine home directory")?;
+        let snippets = rtunnel_install::configure_ssh_include(&home)
+            .context("failed to configure the OpenSSH include")?;
+        println!("OpenSSH snippets directory: {}", snippets.display());
+    }
+
+    let installed_dir = installed
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    if !no_path && !rtunnel_install::is_dir_on_path(&installed_dir) {
+        #[cfg(windows)]
+        match rtunnel_install::add_to_user_path(&installed_dir) {
+            Ok(true) => println!(
+                "Added {} to your user PATH. Restart your terminal (or sign out) to use 'rtunnel'.",
+                installed_dir.display()
+            ),
+            Ok(false) => println!(
+                "{} is already in your user PATH. Restart your terminal (or sign out) to use 'rtunnel'.",
+                installed_dir.display()
+            ),
+            Err(error) => eprintln!(
+                "warning: could not update the user PATH ({error}); add {} manually",
+                installed_dir.display()
+            ),
+        }
+
+        #[cfg(not(windows))]
+        eprintln!(
+            "warning: {} is not on PATH; add it to your shell profile",
+            installed_dir.display()
+        );
+    }
+
+    if let Some(uri) = uri {
+        enroll(state_dir, uri).await?;
+
+        if !no_ssh_config && !no_ssh_hosts {
+            match write_all_ssh_configs(state_dir).await {
+                Ok(hosts) if hosts.is_empty() => println!(
+                    "No agent grants found yet; run 'rtunnel ssh-config --all --write' after a grant is added."
+                ),
+                Ok(hosts) => {
+                    println!("Configured SSH hosts for: {}", hosts.join(", "));
+                    println!("Connect with: ssh <user>@{}", hosts[0]);
+                }
+                Err(e) => eprintln!(
+                    "warning: could not create SSH host entries yet ({e:#}); run 'rtunnel ssh-config --all --write' after the agent is online"
+                ),
+            }
+        }
+    } else {
+        println!("Enroll with: rtunnel enroll \"rtunnel://...\" or run 'rtunnel setup'");
+    }
+
+    Ok(())
+}
+
+async fn enroll(state_dir: &Path, uri: &str) -> Result<()> {
+    eprintln!("Parsing enrollment URI...");
+    let parsed_uri = EnrollmentUri::parse(uri).context("invalid enrollment URI")?;
+    rtunnel_install::create_private_dir(state_dir)
+        .with_context(|| format!("cannot create state directory {}", state_dir.display()))?;
+
+    let id = generate_identity("client")?;
+    save_identity(state_dir, &id)?;
+
+    let verifier = Arc::new(PinnedServerVerifier::new(&parsed_uri.relay_fingerprint));
+    let connection = dial_relay(
+        &parsed_uri.host,
+        parsed_uri.port,
+        &id,
+        verifier,
+        ALPN_ENROLL,
+    )
+    .await
+    .context("relay connection failed during enrollment")?;
+
+    let (mut send, mut recv) = connection.open_bi().await?;
+    let enroll_msg = ControlMessage::Enroll {
+        token: parsed_uri.token,
+    };
+    write_frame(&mut send, &enroll_msg).await?;
+
+    let (name, role) = match read_frame(&mut recv).await? {
+        ControlMessage::EnrollAck { name, role } => (name, role),
+        ControlMessage::Error { code, message } => {
+            bail!("relay rejected enrollment: {code} - {message}");
+        }
+        _ => bail!("unexpected relay response during enrollment"),
+    };
+
+    if role != "client" {
+        bail!("token authorized for role '{role}', expected 'client'");
+    }
+
+    let config = ClientConfig {
+        relay_host: parsed_uri.host,
+        relay_port: parsed_uri.port,
+        relay_fingerprint: parsed_uri.relay_fingerprint,
+        client_name: name,
+    };
+    config.save(state_dir)?;
+
+    eprintln!("Client enrolled successfully as '{}'.", config.client_name);
+    eprintln!("Config written to {}", state_dir.display());
+    Ok(())
+}
+
 async fn run_setup(state_dir: &Path, relay_host: &str, relay_port: u16) -> Result<()> {
     println!("=== rtunnel Instant Setup ===");
     rtunnel_install::create_private_dir(state_dir)?;
@@ -179,8 +346,7 @@ async fn run_setup(state_dir: &Path, relay_host: &str, relay_port: u16) -> Resul
     println!("Generating your unique 9-digit Device ID...");
 
     let endpoint = create_client_endpoint(BIND_ADDR)?;
-    // During initial zero-config bootstrap, verify relay and request device registration
-    let verifier = Arc::new(PinnedServerVerifier::new(&id.fingerprint)); // fallback/pinning
+    let verifier = Arc::new(PinnedServerVerifier::new(&id.fingerprint));
     let client_config = make_client_config(
         &id.certificate_der,
         &id.private_key_pem,
@@ -422,11 +588,157 @@ async fn run_connect(
     }
 }
 
+async fn fetch_agents(state_dir: &Path) -> Result<Vec<AgentDetail>> {
+    let (config, id) = load_client_state(state_dir)?;
+
+    let verifier = Arc::new(PinnedServerVerifier::new(&config.relay_fingerprint));
+    let connection = dial_relay(
+        &config.relay_host,
+        config.relay_port,
+        &id,
+        verifier,
+        ALPN_TUNNEL,
+    )
+    .await?;
+
+    let (mut send, mut recv) = connection.open_bi().await?;
+    let req = ControlMessage::ListAgentsDetailed {
+        client_name: config.client_name.clone(),
+    };
+    write_frame(&mut send, &req).await?;
+
+    match read_frame(&mut recv).await? {
+        ControlMessage::AgentsDetailedResponse { agents } => Ok(agents),
+        ControlMessage::Error { .. } => {
+            let (mut send, mut recv) = connection.open_bi().await?;
+            let req = ControlMessage::ListAgents {
+                client_name: config.client_name,
+            };
+            write_frame(&mut send, &req).await?;
+            match read_frame(&mut recv).await? {
+                ControlMessage::ListAgentsResponse { agents } => Ok(agents
+                    .into_iter()
+                    .map(|a| AgentDetail {
+                        name: a.name,
+                        online: a.online,
+                        targets: Vec::new(),
+                    })
+                    .collect()),
+                other => bail!("unexpected response from relay: {other:?}"),
+            }
+        }
+        other => bail!("unexpected response from relay: {other:?}"),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SshHost {
+    alias: String,
+    agent: String,
+    target: Option<String>,
+}
+
+fn ssh_config_snippet(host_alias: &str, agent: &str, target: Option<&str>) -> String {
+    let target_suffix = target.map_or(String::new(), |dest| format!(" {dest}"));
+    format!("Host {host_alias}\n    ProxyCommand rtunnel connect {agent}{target_suffix}\n")
+}
+
+fn target_alias(agent: &str, target: &str, used: &mut BTreeSet<String>) -> Option<String> {
+    let hp = HostPort::parse(target).ok()?;
+    let mut base = hp.host.to_ascii_lowercase();
+    if hp.port != 22 {
+        base.push('-');
+        base.push_str(&hp.port.to_string());
+    }
+
+    if base.is_empty()
+        || base.len() > 253
+        || base == agent
+        || base.contains(':')
+        || base
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, '*' | '?' | '!'))
+    {
+        return None;
+    }
+
+    let mut alias = base.clone();
+    if used.contains(&alias) {
+        alias = format!("{agent}-{base}");
+    }
+    let mut suffix = 2_u32;
+    while used.contains(&alias) {
+        alias = format!("{agent}-{base}-{suffix}");
+        suffix += 1;
+    }
+    used.insert(alias.clone());
+    Some(alias)
+}
+
+fn ssh_hosts(agent: &str, targets: &[String]) -> Vec<SshHost> {
+    let mut used = BTreeSet::from([agent.to_string()]);
+    let mut hosts = vec![SshHost {
+        alias: agent.to_string(),
+        agent: agent.to_string(),
+        target: None,
+    }];
+
+    for target in targets.iter().skip(1) {
+        if let Some(alias) = target_alias(agent, target, &mut used) {
+            hosts.push(SshHost {
+                alias,
+                agent: agent.to_string(),
+                target: Some(target.clone()),
+            });
+        }
+    }
+    hosts
+}
+
+fn render_snippets(hosts: &[SshHost]) -> String {
+    hosts
+        .iter()
+        .map(|host| ssh_config_snippet(&host.alias, &host.agent, host.target.as_deref()))
+        .collect()
+}
+
+fn write_agent_snippet(snippets: &Path, agent: &str, hosts: &[SshHost]) -> Result<PathBuf> {
+    if !is_valid_name(agent) {
+        bail!("refusing to write a snippet for invalid agent name '{agent}'");
+    }
+    let path = snippets.join(format!("{agent}.conf"));
+    std::fs::write(&path, render_snippets(hosts))
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(path)
+}
+
+async fn write_all_ssh_configs(state_dir: &Path) -> Result<Vec<String>> {
+    let agents = fetch_agents(state_dir).await?;
+    let home = BaseDirs::new()
+        .map(|dirs| dirs.home_dir().to_path_buf())
+        .context("cannot determine home directory")?;
+    let snippets = rtunnel_install::configure_ssh_include(&home)
+        .context("failed to configure the OpenSSH include")?;
+
+    let mut written = Vec::new();
+    for agent in agents {
+        if !is_valid_name(&agent.name) {
+            continue;
+        }
+        write_agent_snippet(
+            &snippets,
+            &agent.name,
+            &ssh_hosts(&agent.name, &agent.targets),
+        )?;
+        written.push(agent.name);
+    }
+    Ok(written)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    // Stderr logging only to preserve stdout for ProxyCommand tunnel bytes
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(EnvFilter::from_default_env())
@@ -460,9 +772,8 @@ async fn main() -> Result<()> {
             run_host(&state_dir).await?;
         }
         Command::Service { action } => match action {
-            ServiceCommand::Install { relay_host } => {
+            ServiceCommand::Install { relay_host: _ } => {
                 let bin = std::env::current_exe()?;
-                let _host_arg = relay_host.unwrap_or_else(|| DEFAULT_RELAY_HOST.to_string());
                 rtunnel_install::install_service(
                     "rtunnel",
                     &bin,
@@ -474,37 +785,35 @@ async fn main() -> Result<()> {
             ServiceCommand::Start => println!("Starting service..."),
             ServiceCommand::Stop => println!("Stopping service..."),
         },
+        Command::Install {
+            uri,
+            bin_dir,
+            no_ssh_config,
+            no_ssh_hosts,
+            no_path,
+        } => {
+            install_client(
+                &state_dir,
+                uri.as_deref(),
+                bin_dir,
+                no_ssh_config,
+                no_ssh_hosts,
+                no_path,
+            )
+            .await?;
+        }
         Command::Enroll { uri } => {
-            eprintln!("Legacy token enroll: {uri}");
+            enroll(&state_dir, &uri).await?;
         }
         Command::Agents => {
-            println!("{:<15} {:<8} OTHER TARGETS", "DEVICE ID", "STATUS");
-            let (config, id) = load_client_state(&state_dir)?;
-            let verifier = Arc::new(PinnedServerVerifier::new(&config.relay_fingerprint));
-            let conn = dial_relay(
-                &config.relay_host,
-                config.relay_port,
-                &id,
-                verifier,
-                ALPN_TUNNEL,
-            )
-            .await?;
-            let (mut s, mut r) = conn.open_bi().await?;
-            write_frame(
-                &mut s,
-                &ControlMessage::ListAgentsDetailed {
-                    client_name: config.client_name,
-                },
-            )
-            .await?;
-            if let ControlMessage::AgentsDetailedResponse { agents } = read_frame(&mut r).await? {
-                for a in agents {
-                    println!(
-                        "{:<15} {:<8}",
-                        format_device_id(&a.name),
-                        if a.online { "online" } else { "offline" }
-                    );
-                }
+            println!("{:<15} {:<8}", "DEVICE ID", "STATUS");
+            let agents = fetch_agents(&state_dir).await?;
+            for a in agents {
+                println!(
+                    "{:<15} {:<8}",
+                    format_device_id(&a.name),
+                    if a.online { "online" } else { "offline" }
+                );
             }
         }
         Command::SshConfig { .. } => {
