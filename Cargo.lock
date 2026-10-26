@@ -1284,6 +1284,7 @@ dependencies = [
  "rtunnel-relay",
  "rtunnel-transport",
  "rustls",
+ "serde_json",
  "sha2",
  "tempfile",
  "tokio",

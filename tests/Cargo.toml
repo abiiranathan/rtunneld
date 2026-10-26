@@ -21,6 +21,9 @@ rtunnel-relay = { path = "../crates/relay" }
 rtunnel-agent = { path = "../crates/agent" }
 rtunnel-client = { path = "../crates/client" }
 
+[dev-dependencies]
+serde_json = "1"
+
 [[test]]
 name = "integration_test"
 path = "integration_test.rs"

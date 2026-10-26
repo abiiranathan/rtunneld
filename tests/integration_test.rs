@@ -12,35 +12,67 @@ use rtunnel_transport::{create_client_endpoint, make_client_config, read_frame, 
 use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
-/// Dynamically resolves the `rtunnel` binary across workspace packages and target profiles.
+/// Resolves the `rtunnel` binary, building it first if Cargo did not.
+///
+/// `CARGO_BIN_EXE_rtunnel` is only provided to integration tests in the same
+/// package as the bin target, so otherwise we ask Cargo to build it and report
+/// the artifact path. The result is cached for the lifetime of the process.
 fn rtunnel_binary_path() -> PathBuf {
-    if let Ok(var) = std::env::var("CARGO_BIN_EXE_rtunnel") {
-        let p = PathBuf::from(var);
-        if p.exists() {
-            return p;
-        }
-    }
-    let mut path = std::env::current_exe().expect("cannot determine test executable path");
-    path.pop(); // pop test exe name
-    if path.file_name().and_then(|s| s.to_str()) == Some("deps") {
-        path.pop(); // pop deps/
-    }
-    #[cfg(windows)]
-    path.push("rtunnel.exe");
-    #[cfg(not(windows))]
-    path.push("rtunnel");
+    static BIN: OnceLock<PathBuf> = OnceLock::new();
 
-    if path.exists() {
-        path
-    } else {
-        assert_cmd::cargo::cargo_bin("rtunnel")
-    }
+    BIN.get_or_init(|| {
+        // Fast path: same-package integration test.
+        if let Some(var) = std::env::var_os("CARGO_BIN_EXE_rtunnel") {
+            let p = PathBuf::from(var);
+            if p.exists() {
+                return p;
+            }
+        }
+
+        // Reuse the cargo that is running this test; fall back to PATH.
+        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+
+        // Diagnostics go to stderr (inherited), JSON artifacts to stdout.
+        // --workspace is required so `--bin` can resolve across member packages.
+        let output = Command::new(cargo)
+            .args([
+                "build",
+                "--workspace",
+                "--bin",
+                "rtunnel",
+                "--message-format=json-render-diagnostics",
+            ])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .stderr(Stdio::inherit())
+            .output()
+            .expect("failed to spawn cargo to build rtunnel");
+        assert!(output.status.success(), "cargo build of rtunnel failed");
+
+        // Take the last matching artifact message; it carries the exact path,
+        // independent of profile, target triple, or CARGO_TARGET_DIR.
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|msg| msg["reason"] == "compiler-artifact")
+            .filter(|msg| msg["target"]["name"] == "rtunnel")
+            .filter(|msg| {
+                msg["target"]["kind"]
+                    .as_array()
+                    .is_some_and(|k| k.iter().any(|v| v == "bin"))
+            })
+            .filter_map(|msg| msg["executable"].as_str().map(PathBuf::from))
+            .next_back()
+            .expect("cargo did not report an rtunnel executable")
+    })
+    .clone()
 }
 
 struct TestHarness {
