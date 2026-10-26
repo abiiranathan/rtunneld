@@ -6,6 +6,7 @@
 //! These helpers keep packaging details inside the shipped executables so that
 //! a downloaded binary can install itself without a source checkout.
 
+use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -13,6 +14,9 @@ use std::process::Command;
 
 /// Default directory for system-wide executables.
 pub const DEFAULT_BIN_DIR: &str = "/usr/local/bin";
+
+/// File name suffix used for executables on the current platform.
+pub const EXE_SUFFIX: &str = if cfg!(windows) { ".exe" } else { "" };
 
 /// Default directory for systemd unit files.
 pub const DEFAULT_SYSTEMD_DIR: &str = "/etc/systemd/system";
@@ -53,6 +57,138 @@ pub fn ensure_root() -> io::Result<()> {
             "this command must run as root (try sudo)",
         ))
     }
+}
+
+/// Returns the platform-specific executable file name for `stem`.
+///
+/// On Windows this appends `.exe`; on other platforms the name is unchanged.
+#[must_use]
+pub fn executable_name(stem: &str) -> String {
+    let mut name = String::with_capacity(stem.len() + EXE_SUFFIX.len());
+    name.push_str(stem);
+    name.push_str(EXE_SUFFIX);
+    name
+}
+
+/// Returns `true` when `dir` appears in the supplied `PATH`-style value.
+///
+/// Entries are compared case-insensitively on Windows, quotes are ignored, and
+/// trailing path separators do not affect the result.
+#[must_use]
+pub fn path_contains(path_value: &OsStr, dir: &Path) -> bool {
+    let target = normalize_path_entry(dir.as_os_str());
+    !target.is_empty()
+        && std::env::split_paths(path_value)
+            .any(|entry| normalize_path_entry(entry.as_os_str()) == target)
+}
+
+/// Returns `true` when `dir` appears in the current process `PATH`.
+#[must_use]
+pub fn is_dir_on_path(dir: &Path) -> bool {
+    std::env::var_os("PATH").is_some_and(|value| path_contains(&value, dir))
+}
+
+/// Adds `dir` to the current user's persistent `PATH` on Windows.
+///
+/// Returns `true` when the entry was added, or `false` when it was already
+/// present. This is a no-op returning `false` on non-Windows platforms, where
+/// `PATH` is managed by the shell.
+///
+/// # Errors
+///
+/// Returns an error when the user environment registry key cannot be read or
+/// written, or when `dir` contains a semicolon.
+#[cfg(windows)]
+pub fn add_to_user_path(dir: &Path) -> io::Result<bool> {
+    use winreg::RegKey;
+    use winreg::RegValue;
+    use winreg::enums::{HKEY_CURRENT_USER, RegType};
+
+    let dir_text = dir.to_string_lossy();
+    if dir_text.contains(';') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "PATH entries must not contain semicolons",
+        ));
+    }
+
+    let (environment, _) = RegKey::predef(HKEY_CURRENT_USER).create_subkey("Environment")?;
+    let raw = match environment.get_raw_value("Path") {
+        Ok(value) => Some(value),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+
+    let current = raw
+        .as_ref()
+        .map_or_else(String::new, |value| decode_reg_string(&value.bytes));
+    if path_contains(OsStr::new(&current), dir) {
+        return Ok(false);
+    }
+
+    let updated = if current.trim().is_empty() {
+        dir_text.into_owned()
+    } else {
+        format!("{};{dir_text}", current.trim_end_matches(';'))
+    };
+    let vtype = raw
+        .as_ref()
+        .map_or(RegType::REG_EXPAND_SZ, |value| value.vtype.clone());
+    environment.set_raw_value(
+        "Path",
+        &RegValue {
+            vtype,
+            bytes: encode_reg_string(&updated).into(),
+        },
+    )?;
+    Ok(true)
+}
+
+/// Adds `dir` to the current user's persistent `PATH`.
+///
+/// This is a no-op on non-Windows platforms; see the Windows implementation.
+///
+/// # Errors
+///
+/// Never returns an error on non-Windows platforms.
+#[cfg(not(windows))]
+pub fn add_to_user_path(_dir: &Path) -> io::Result<bool> {
+    Ok(false)
+}
+
+fn normalize_path_entry(entry: &OsStr) -> String {
+    let text = entry.to_string_lossy();
+    let text = text.trim().trim_matches('"');
+    let trimmed = text.trim_end_matches(['/', '\\']);
+    // Preserve a bare root such as `/` or `\` instead of normalizing it to an
+    // empty string, which would match empty `PATH` entries.
+    let text = if trimmed.is_empty() { text } else { trimmed };
+    if cfg!(windows) {
+        text.to_ascii_lowercase()
+    } else {
+        text.to_string()
+    }
+}
+
+#[cfg(windows)]
+fn decode_reg_string(bytes: &[u8]) -> String {
+    let (chunks, _) = bytes.as_chunks::<2>();
+    let units: Vec<u16> = chunks
+        .iter()
+        .map(|chunk| u16::from_le_bytes(*chunk))
+        .collect();
+    let end = units
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(units.len());
+    String::from_utf16_lossy(&units[..end])
+}
+
+#[cfg(windows)]
+fn encode_reg_string(text: &str) -> Vec<u8> {
+    let mut bytes: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    bytes.extend_from_slice(&[0, 0]);
+    bytes
 }
 
 /// Creates `path` and applies mode `0700` on Unix.
@@ -253,7 +389,7 @@ pub fn enable_service(unit_name: &str, start: bool) -> io::Result<()> {
     Ok(())
 }
 
-/// Adds an `Include ~/.ssh/rtunnel.d/*` line to `~/.ssh/config` if needed.
+/// Adds an `Include` line to `~/.ssh/config` that loads rtunnel SSH snippets.
 ///
 /// Returns the snippets directory that OpenSSH will load.
 ///
@@ -273,10 +409,14 @@ pub fn configure_ssh_include(home: &Path) -> io::Result<PathBuf> {
     }
     set_mode(&config, 0o600)?;
 
+    let include_line = ssh_include_line(home);
     let contents = fs::read_to_string(&config)?;
-    if !contents.lines().any(|line| line.trim() == SSH_INCLUDE_LINE) {
-        let mut updated = String::with_capacity(contents.len() + SSH_INCLUDE_LINE.len() + 3);
-        updated.push_str(SSH_INCLUDE_LINE);
+    if !contents
+        .lines()
+        .any(|line| line.trim() == include_line.as_str())
+    {
+        let mut updated = String::with_capacity(contents.len() + include_line.len() + 3);
+        updated.push_str(&include_line);
         updated.push_str("\n\n");
         updated.push_str(&contents);
         fs::write(&config, updated)?;
@@ -284,6 +424,24 @@ pub fn configure_ssh_include(home: &Path) -> io::Result<PathBuf> {
     }
 
     Ok(snippets_dir)
+}
+
+/// Returns the `Include` line that loads rtunnel SSH snippets for `home`.
+///
+/// Windows OpenSSH does not reliably expand `~`, so the line uses an absolute
+/// path with forward slashes and quotes, which also covers home directories
+/// containing spaces. Other platforms keep the portable `~` form.
+#[must_use]
+pub fn ssh_include_line(home: &Path) -> String {
+    if cfg!(windows) {
+        let pattern = home.join(".ssh").join("rtunnel.d").join("*");
+        format!(
+            "Include \"{}\"",
+            pattern.to_string_lossy().replace('\\', "/")
+        )
+    } else {
+        SSH_INCLUDE_LINE.to_string()
+    }
 }
 
 fn absolute_path(path: &Path) -> io::Result<PathBuf> {
@@ -353,13 +511,21 @@ fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "keeps the signature identical to the Unix implementation used in `?` chains"
+)]
 fn set_mode(_path: &Path, _mode: u32) -> io::Result<()> {
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{configure_ssh_include, install_self, render_unit};
+    use super::{
+        configure_ssh_include, executable_name, install_self, path_contains, render_unit,
+        ssh_include_line,
+    };
+    use std::ffi::OsStr;
     use std::fs;
     use std::path::Path;
 
@@ -407,7 +573,57 @@ mod tests {
 
         assert_eq!(first, second);
         let config = fs::read_to_string(home.path().join(".ssh/config")).expect("read ssh config");
-        assert_eq!(config.matches("Include ~/.ssh/rtunnel.d/*").count(), 1);
+        assert_eq!(
+            config
+                .matches(ssh_include_line(home.path()).as_str())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn keeps_unix_include_line_portable() {
+        #[cfg(unix)]
+        assert_eq!(
+            ssh_include_line(Path::new("/home/alice")),
+            "Include ~/.ssh/rtunnel.d/*"
+        );
+    }
+
+    #[test]
+    fn uses_absolute_windows_include_line() {
+        #[cfg(windows)]
+        assert_eq!(
+            ssh_include_line(Path::new(r"C:\Users\Alice Smith")),
+            "Include \"C:/Users/Alice Smith/.ssh/rtunnel.d/*\""
+        );
+    }
+
+    #[test]
+    fn appends_platform_executable_suffix() {
+        assert_eq!(
+            executable_name("rtunnel"),
+            format!("rtunnel{}", super::EXE_SUFFIX)
+        );
+    }
+
+    #[test]
+    fn detects_path_entries() {
+        #[cfg(unix)]
+        {
+            let path = OsStr::new("/usr/bin:/opt/rtunnel/:\"/opt/with space\"");
+            assert!(path_contains(path, Path::new("/opt/rtunnel")));
+            assert!(path_contains(path, Path::new("/opt/with space")));
+            assert!(!path_contains(path, Path::new("/opt/rtunnel/bin")));
+            assert!(path_contains(OsStr::new("/"), Path::new("/")));
+        }
+
+        #[cfg(windows)]
+        {
+            let path = OsStr::new(r"C:\Windows;C:\Program Files\RTunnel\;");
+            assert!(path_contains(path, Path::new(r"c:\program files\rtunnel")));
+            assert!(!path_contains(path, Path::new(r"C:\Windows\System32")));
+        }
     }
 
     #[test]

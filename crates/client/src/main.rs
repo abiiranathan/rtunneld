@@ -3,7 +3,9 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
-use directories::{BaseDirs, ProjectDirs};
+use directories::BaseDirs;
+#[cfg(not(windows))]
+use directories::ProjectDirs;
 use quinn::Connection;
 use rtunnel_client::ClientConfig;
 use rtunnel_identity::{
@@ -30,7 +32,8 @@ const EXIT_FAILURE: i32 = 1;
 #[derive(Parser, Debug)]
 #[command(name = "rtunnel", version, about = "Client CLI for rtunnel QUIC relay")]
 struct Cli {
-    /// Override the default configuration and state directory (`~/.config/rtunnel`).
+    /// Override the default configuration and state directory
+    /// (`~/.config/rtunnel`, or `%APPDATA%\rtunnel` on Windows).
     #[arg(long, global = true)]
     state_dir: Option<PathBuf>,
     #[command(subcommand)]
@@ -67,23 +70,43 @@ enum Command {
     Install {
         /// Optional enrollment URI; the client is enrolled after installation.
         uri: Option<String>,
-        /// Directory to install into. Defaults to `/usr/local/bin` for root and
-        /// `~/.local/bin` for unprivileged users.
+        /// Directory to install into. Defaults to `/usr/local/bin` for root,
+        /// `~/.local/bin` for other Unix users, and
+        /// `%LOCALAPPDATA%\Programs\rtunnel` on Windows.
         #[arg(long)]
         bin_dir: Option<PathBuf>,
         /// Do not add the rtunnel snippet directory to `~/.ssh/config`.
         #[arg(long)]
         no_ssh_config: bool,
+        /// Do not add the install directory to the user `PATH` (Windows).
+        #[arg(long)]
+        no_path: bool,
     },
 }
 
 fn resolve_state_dir(override_dir: Option<PathBuf>) -> PathBuf {
-    override_dir.unwrap_or_else(|| {
+    override_dir.unwrap_or_else(default_state_dir)
+}
+
+fn default_state_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        // `%APPDATA%\rtunnel` is the conventional per-user application data
+        // location and avoids the duplicated organization/application path
+        // produced by `ProjectDirs`.
+        BaseDirs::new().map_or_else(
+            || PathBuf::from(".rtunnel"),
+            |dirs| dirs.data_dir().join("rtunnel"),
+        )
+    }
+
+    #[cfg(not(windows))]
+    {
         ProjectDirs::from("com", "rtunnel", "rtunnel").map_or_else(
             || PathBuf::from(".rtunnel"),
             |proj| proj.config_dir().to_path_buf(),
         )
-    })
+    }
 }
 
 /// Loads the enrolled client's configuration and identity from `state_dir`.
@@ -272,12 +295,21 @@ async fn list_agents(state_dir: &Path) -> Result<()> {
 
 /// Returns the default installation directory for the client binary.
 fn default_client_bin_dir() -> Result<PathBuf> {
-    if rtunnel_install::is_root() {
-        return Ok(PathBuf::from(rtunnel_install::DEFAULT_BIN_DIR));
+    #[cfg(windows)]
+    {
+        let dirs = BaseDirs::new().context("cannot determine home directory")?;
+        // Per-user program directory, which does not require elevation.
+        Ok(dirs.data_local_dir().join("Programs").join("rtunnel"))
     }
 
-    let dirs = BaseDirs::new().context("cannot determine home directory")?;
-    Ok(dirs.home_dir().join(".local").join("bin"))
+    #[cfg(not(windows))]
+    {
+        if rtunnel_install::is_root() {
+            return Ok(PathBuf::from(rtunnel_install::DEFAULT_BIN_DIR));
+        }
+        let dirs = BaseDirs::new().context("cannot determine home directory")?;
+        Ok(dirs.home_dir().join(".local").join("bin"))
+    }
 }
 
 /// Installs the running client binary and prepares the user's SSH environment.
@@ -286,12 +318,13 @@ async fn install_client(
     uri: Option<&str>,
     bin_dir: Option<PathBuf>,
     no_ssh_config: bool,
+    no_path: bool,
 ) -> Result<()> {
     let bin_dir = match bin_dir {
         Some(dir) => dir,
         None => default_client_bin_dir()?,
     };
-    let bin_path = bin_dir.join("rtunnel");
+    let bin_path = bin_dir.join(rtunnel_install::executable_name("rtunnel"));
     let installed = rtunnel_install::install_self(&bin_path)
         .with_context(|| format!("failed to install {}", bin_path.display()))?;
     println!("Installed rtunnel at {}", installed.display());
@@ -309,14 +342,28 @@ async fn install_client(
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .to_path_buf();
-    if let Some(path_var) = std::env::var_os("PATH") {
-        let on_path = std::env::split_paths(&path_var).any(|entry| entry == installed_dir);
-        if !on_path {
-            eprintln!(
-                "warning: {} is not on PATH; add it to your shell profile",
+    if !no_path && !rtunnel_install::is_dir_on_path(&installed_dir) {
+        #[cfg(windows)]
+        match rtunnel_install::add_to_user_path(&installed_dir) {
+            Ok(true) => println!(
+                "Added {} to your user PATH. Restart your terminal (or sign out) to use 'rtunnel'.",
                 installed_dir.display()
-            );
+            ),
+            Ok(false) => println!(
+                "{} is already in your user PATH. Restart your terminal (or sign out) to use 'rtunnel'.",
+                installed_dir.display()
+            ),
+            Err(error) => eprintln!(
+                "warning: could not update the user PATH ({error}); add {} manually",
+                installed_dir.display()
+            ),
         }
+
+        #[cfg(not(windows))]
+        eprintln!(
+            "warning: {} is not on PATH; add it to your shell profile",
+            installed_dir.display()
+        );
     }
 
     if let Some(uri) = uri {
@@ -411,6 +458,7 @@ async fn main() -> Result<()> {
             uri,
             bin_dir,
             no_ssh_config,
-        } => install_client(&state_dir, uri.as_deref(), bin_dir, no_ssh_config).await,
+            no_path,
+        } => install_client(&state_dir, uri.as_deref(), bin_dir, no_ssh_config, no_path).await,
     }
 }

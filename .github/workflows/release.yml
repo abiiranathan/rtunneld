@@ -18,23 +18,37 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
+            archive: tar.gz
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            archive: zip
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
       - name: Install musl toolchain
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Build release binaries
+        if: runner.os == 'Linux'
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
           CC_aarch64_unknown_linux_musl: musl-gcc
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
         run: cargo build --release --locked --workspace --target ${{ matrix.target }}
-      - name: Package release asset
+      - name: Build Windows client
+        if: runner.os == 'Windows'
+        run: cargo build --release --locked -p rtunnel-client --target ${{ matrix.target }}
+      - name: Package release asset (Unix)
+        if: runner.os == 'Linux'
         run: |
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/rtunneld" dist/
@@ -45,10 +59,22 @@ jobs:
           cd dist
           sha256sum "rtunnel-${{ matrix.target }}.tar.gz" \
             > "rtunnel-${{ matrix.target }}.tar.gz.sha256"
+      - name: Package release asset (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/rtunnel.exe" dist/
+          Compress-Archive -Path "dist/rtunnel.exe" `
+            -DestinationPath "dist/rtunnel-${{ matrix.target }}.zip" -Force
+          $hash = (Get-FileHash "dist/rtunnel-${{ matrix.target }}.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText(
+            "dist/rtunnel-${{ matrix.target }}.zip.sha256",
+            "$hash  rtunnel-${{ matrix.target }}.zip`n")
       - uses: actions/upload-artifact@v4
         with:
           name: rtunnel-${{ matrix.target }}
-          path: dist/rtunnel-${{ matrix.target }}.tar.gz*
+          path: dist/rtunnel-${{ matrix.target }}.${{ matrix.archive }}*
 
   release:
     needs: build
@@ -67,5 +93,6 @@ jobs:
         with:
           files: |
             dist/*.tar.gz
+            dist/*.zip
             dist/SHA256SUMS
           generate_release_notes: true

@@ -156,6 +156,7 @@ pub fn load_identity(state_dir: &Path) -> Result<KeyMaterial, IdentityError> {
     let key_path = state_dir.join("identity.key");
     let cert_path = state_dir.join("identity.crt");
 
+    #[cfg(unix)]
     let meta = fs::metadata(&key_path).map_err(|e| IdentityError::Io(e.to_string()))?;
     #[cfg(unix)]
     {

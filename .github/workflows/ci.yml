@@ -21,3 +21,55 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings -W clippy::pedantic
       - name: test
         run: cargo test --workspace --all-targets
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: fmt
+        run: cargo fmt --check
+      - name: PowerShell scripts
+        shell: pwsh
+        run: |
+          $failed = $false
+          foreach ($file in Get-ChildItem scripts/*.ps1) {
+            $parseErrors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              $file.FullName, [ref]$null, [ref]$parseErrors) | Out-Null
+            if ($parseErrors) {
+              $parseErrors | ForEach-Object { Write-Error "$($file.Name): $_" }
+              $failed = $true
+            }
+          }
+          if ($failed) { exit 1 }
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings -W clippy::pedantic
+      - name: test
+        run: cargo test --workspace --all-targets
+      - name: installer smoke test
+        shell: pwsh
+        run: |
+          cargo build -p rtunnel-client
+          $installDir = Join-Path $env:RUNNER_TEMP 'rtunnel-bin'
+          ./scripts/install.ps1 -BinaryPath "target/debug/rtunnel.exe" `
+            -BinDir $installDir -NoPath -NoSshConfig
+          & (Join-Path $installDir 'rtunnel.exe') --version
+
+          # Exercise the user PATH update and restore it afterwards.
+          $originalPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+          try {
+            ./scripts/install.ps1 -BinaryPath "target/debug/rtunnel.exe" `
+              -BinDir $installDir -NoSshConfig
+            $updatedPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+            $entries = @($updatedPath -split ';' | Where-Object { $_ -ne '' })
+            if ($entries -notcontains $installDir) {
+              throw "installer did not add $installDir to the user PATH"
+            }
+          }
+          finally {
+            [Environment]::SetEnvironmentVariable('Path', $originalPath, 'User')
+          }
+

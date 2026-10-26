@@ -24,7 +24,7 @@
 
 ## Quick Install (Prebuilt Binaries)
 
-Targets need neither a source checkout nor a Rust toolchain. The bootstrapper downloads the requested release, verifies its SHA-256 checksum when available, and runs the binary's built-in `install` command. The hardened systemd units are embedded in the binaries, so nothing from `deploy/` has to be copied to a target.
+Targets need neither a source checkout nor a Rust toolchain. The bootstrapper downloads the requested release, verifies its SHA-256 checksum when available, and runs the binary's built-in `install` command. The hardened systemd units are embedded in the binaries, so nothing from `deploy/` has to be copied to a target. The relay and agent are Linux-only; the client is also available for Windows (see [Windows Client](#windows-client)).
 
 ### 1. Relay (public host)
 
@@ -84,6 +84,46 @@ ssh user@clinic-a
 
 `rtunnel ssh-config clinic-a` prints the same snippet if you prefer to place it manually.
 
+### Windows Client
+
+The relay and agent are Linux-only. The client runs on Windows 10/11 with the
+bundled Windows OpenSSH client. Run PowerShell as your normal user (no
+administrator prompt is needed):
+
+```powershell
+# Download and run the installer. Pass the enrollment URI printed by
+# `rtunneld token create --role client`.
+$installer = Join-Path $env:TEMP "install-rtunnel.ps1"
+Invoke-WebRequest -UseBasicParsing `
+  https://raw.githubusercontent.com/abiiranathan/rtunneld/main/scripts/install.ps1 `
+  -OutFile $installer
+powershell -ExecutionPolicy Bypass -File $installer `
+  "rtunnel://relay.example.com:4433/?fp=<relay_fp>&token=<client_token>"
+```
+
+The Windows installer:
+
+- installs `rtunnel.exe` to `%LOCALAPPDATA%\Programs\rtunnel`,
+- adds that directory to your user `PATH` (use `-NoPath` to skip),
+- adds an absolute `Include` for `%USERPROFILE%\.ssh\rtunnel.d\*` to
+  `%USERPROFILE%\.ssh\config` (use `-NoSshConfig` to skip),
+- verifies the release SHA-256 checksum when `SHA256SUMS` is available,
+- enrolls the client when a URI is supplied.
+
+Open a new terminal after installation so the updated `PATH` takes effect, then
+generate the SSH host entry and connect:
+
+```powershell
+rtunnel ssh-config clinic-a --write
+ssh user@clinic-a
+```
+
+Use `-Version v0.2.0` to pin a release, `-BinaryPath .\rtunnel.exe` to install a
+binary you already built, and `-DownloadBase <url>` to use a mirror. The
+environment variables used by `install.sh` (`RTUNNEL_VERSION`, `RTUNNEL_REPO`,
+`RTUNNEL_TARGET`, `RTUNNEL_BIN`, `RTUNNEL_BIN_DIR`, `RTUNNEL_DOWNLOAD_BASE`) are
+also honored.
+
 ### Pinning a Version or Using a Local Binary
 
 The bootstrapper uses GitHub releases. Override the release or target when needed:
@@ -112,7 +152,13 @@ sudo ./rtunnel-agent install "rtunnel://relay.example.com:4433/?fp=<relay_fp>&to
 ./rtunnel install "rtunnel://relay.example.com:4433/?fp=<relay_fp>&token=<client_token>"
 ```
 
-Use `--no-start` to write the unit without enabling or starting it. Use `--bin-dir` to install the executable somewhere other than the default.
+On Windows, run the client installer directly:
+
+```powershell
+.\rtunnel.exe install "rtunnel://relay.example.com:4433/?fp=<relay_fp>&token=<client_token>"
+```
+
+Use `--no-start` to write the unit without enabling or starting it. Use `--bin-dir` to install the executable somewhere other than the default. Use `--no-path` (client, Windows) to leave the user `PATH` untouched.
 
 ---
 
