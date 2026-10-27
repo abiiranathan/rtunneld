@@ -43,7 +43,7 @@ const PAIRING_CODE_TTL_SECS: u32 = 900;
 #[derive(Parser, Debug)]
 #[command(
     name = "rtunnel",
-    version,
+    version = env!("RTUNNEL_VERSION"),
     about = "AnyDesk-style zero-config SSH remote access daemon & CLI"
 )]
 struct Cli {

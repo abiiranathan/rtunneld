@@ -149,6 +149,9 @@ docker compose -f deploy/docker-compose.yml up -d relay
 # Check systemd status
 sudo systemctl status rtunneld.service
 
+# Confirm the installed build reports the expected release version
+rtunneld --version
+
 # View the real-time append-only security audit log
 sudo tail -f /var/lib/rtunnel/audit.log
 ```
@@ -177,6 +180,9 @@ curl -fsSL https://raw.githubusercontent.com/abiiranathan/rtunneld/main/scripts/
   | sudo bash -s -- relay --listen 0.0.0.0:4433
 
 sudo systemctl status rtunneld.service
+
+# The reported version must match the release tag, for example 0.6.1.
+rtunneld --version
 ```
 
 If you built `rtunneld` from source, run `sudo ./rtunneld install --listen 0.0.0.0:4433`

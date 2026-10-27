@@ -19,7 +19,11 @@ use tracing_subscriber::EnvFilter;
 const AGENT_UNIT_TEMPLATE: &str = include_str!("../../../deploy/systemd/rtunnel-agent.service");
 
 #[derive(Parser, Debug)]
-#[command(name = "rtunnel-agent", version, about = "Agent daemon for rtunnel")]
+#[command(
+    name = "rtunnel-agent",
+    version = env!("RTUNNEL_VERSION"),
+    about = "Agent daemon for rtunnel"
+)]
 struct Cli {
     #[arg(long, global = true, default_value = "/var/lib/rtunnel-agent")]
     state_dir: PathBuf,

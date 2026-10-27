@@ -21,7 +21,11 @@ use tracing_subscriber::EnvFilter;
 const RELAY_UNIT_TEMPLATE: &str = include_str!("../../../deploy/systemd/rtunneld.service");
 
 #[derive(Parser, Debug)]
-#[command(name = "rtunneld", version, about = "Relay daemon for rtunnel")]
+#[command(
+    name = "rtunneld",
+    version = env!("RTUNNEL_VERSION"),
+    about = "Relay daemon for rtunnel"
+)]
 struct Cli {
     #[arg(long, default_value = "text")]
     log_format: String,

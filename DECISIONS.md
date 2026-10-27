@@ -1,5 +1,11 @@
 # Decisions and Assumptions Log
 
+## 2026-10-27 — Release Version Derived From the Git Tag
+- **Problem**: `git semver` only creates and pushes tags; it does not edit `Cargo.toml`. The `v0.6.0` release therefore shipped new code that still reported `0.4.0` from `CARGO_PKG_VERSION`, making a successful upgrade look like a failed one.
+- **Single Workspace Version**: All crates now use `version.workspace = true`, with the value in `[workspace.package]`.
+- **Build-Time Resolution**: A shared `build-support/version.rs` included by the relay, client, and agent build scripts sets `RTUNNEL_VERSION`. It resolves in order: `RTUNNEL_BUILD_VERSION`, the GitHub tag ref (`GITHUB_REF_TYPE=tag`), the exact local git tag, then `CARGO_PKG_VERSION` for source archives without git metadata. The `v` prefix is stripped and only semantic versions are accepted.
+- **Consumers**: Clap's `version` and the `AgentHello.agent_version` field use `RTUNNEL_VERSION`, so `--version` and relay-side agent listings always agree with the release asset.
+
 ## 2026-10-26 — Agent Target Discovery and One-Step Onboarding
 - **Separate Advertisement Stream**: Agents send `AgentTargets` on a dedicated bidirectional stream after `HelloAck` instead of extending `AgentHello`. Postcard is not self-describing, so appending a field to an enum variant would break old readers. An unaccepted stream is harmless to revision 1 relays, which makes rolling upgrades safe in both directions.
 - **Parallel Query Message**: Target-aware clients use `ListAgentsDetailed`/`AgentsDetailedResponse`. If a revision 1 relay rejects the unknown frame, the client falls back to `ListAgents` and reports empty targets. `AgentInfo` and `ListAgentsResponse` are untouched so old clients still decode new relay responses.

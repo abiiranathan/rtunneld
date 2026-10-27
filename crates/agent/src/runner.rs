@@ -122,7 +122,7 @@ impl AgentRunner {
 
         let hello = ControlMessage::AgentHello {
             protocol_minor: PROTOCOL_MINOR,
-            agent_version: env!("CARGO_PKG_VERSION").into(),
+            agent_version: env!("RTUNNEL_VERSION").into(),
             hostname: gethostname(),
         };
         write_frame(&mut ctrl_send, &hello)
