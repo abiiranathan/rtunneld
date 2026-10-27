@@ -441,14 +441,18 @@ async fn run_setup(
         let _ = rtunnel_install::configure_ssh_include(dirs.home_dir());
     }
 
+    print_setup_summary(state_dir, &device_id, &captured_relay_fp)?;
+
+    Ok(())
+}
+
+/// Prints the Device ID, fingerprint, and the next steps after setup.
+fn print_setup_summary(state_dir: &Path, device_id: &str, relay_fingerprint: &str) -> Result<()> {
     println!();
     println!("Setup Complete!");
     println!("--------------------------------------------------");
-    println!(
-        "Your Device ID:            {}",
-        format_device_id(&device_id)
-    );
-    println!("Pinned Relay Fingerprint:  {captured_relay_fp}");
+    println!("Your Device ID:            {}", format_device_id(device_id));
+    println!("Pinned Relay Fingerprint:  {relay_fingerprint}");
     println!("State Directory:           {}", state_dir.display());
     println!("--------------------------------------------------");
     println!("To allow remote access to this machine:");
@@ -456,6 +460,26 @@ async fn run_setup(
     println!();
     println!("To connect to another device:");
     println!("  rtunnel connect <target-device-id>");
+    println!();
+    println!("To keep this machine reachable without an open terminal:");
+    println!("  1. Run `rtunnel host` and approve a client with \"Always Allow\".");
+    println!("  2. Install the background service:");
+    let exe = std::env::current_exe()?;
+    #[cfg(windows)]
+    println!(
+        "     & \"{}\" --state-dir \"{}\" service install",
+        exe.display(),
+        state_dir.display()
+    );
+    #[cfg(not(windows))]
+    println!(
+        "     sudo \"{}\" --state-dir \"{}\" service install",
+        exe.display(),
+        state_dir.display()
+    );
+    println!();
+    println!("The service runs `RUST_LOG=rtunnel_agent=warn rtunnel host` and starts on boot.");
+    println!("It cannot answer pairing prompts, so grant \"Always Allow\" first.");
     println!();
 
     Ok(())

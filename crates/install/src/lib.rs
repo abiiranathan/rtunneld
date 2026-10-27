@@ -240,6 +240,37 @@ pub fn install_self(dest: &Path) -> io::Result<PathBuf> {
     Ok(dest)
 }
 
+/// Environment applied to the generated host service.
+///
+/// The host daemon logs to the service manager's journal, so the agent is kept
+/// quiet during normal unattended operation while errors remain visible.
+#[cfg(target_os = "linux")]
+const SERVICE_ENVIRONMENT: &str = "RUST_LOG=rtunnel_agent=warn";
+
+/// Renders the Linux `systemd` unit for the host daemon.
+#[cfg(target_os = "linux")]
+fn render_host_unit(exec_cmd: &str) -> String {
+    let template = r"[Unit]
+Description=rtunnel background host daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=__SERVICE_ENVIRONMENT__
+ExecStart=__EXEC_CMD__
+Restart=always
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+";
+    template
+        .replace("__SERVICE_ENVIRONMENT__", SERVICE_ENVIRONMENT)
+        .replace("__EXEC_CMD__", exec_cmd)
+}
+
 /// Installs and enables the background service across Linux (`systemd`), macOS (`launchd`), and Windows (`sc.exe`).
 ///
 /// # Errors
@@ -254,22 +285,7 @@ pub fn install_service(
     #[cfg(target_os = "linux")]
     {
         let exec_cmd = format!("{} {}", bin_path.display(), args.join(" "));
-        let template = r"[Unit]
-Description=rtunnel background host daemon
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=__EXEC_CMD__
-Restart=always
-RestartSec=5
-UMask=0077
-
-[Install]
-WantedBy=multi-user.target
-";
-        let contents = template.replace("__EXEC_CMD__", &exec_cmd);
+        let contents = render_host_unit(&exec_cmd);
         let unit_filename = format!("{service_name}.service");
         install_unit(&unit_filename, &contents)?;
         enable_service(&unit_filename, true)?;
@@ -304,6 +320,11 @@ WantedBy=multi-user.target
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key>
+        <string>rtunnel_agent=warn</string>
+    </dict>
     <key>StandardErrorPath</key>
     <string>{}/daemon.log</string>
 </dict>
@@ -902,5 +923,17 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o755);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn host_unit_quiets_agent_logs() {
+        let unit = super::render_host_unit("/usr/local/bin/rtunnel host --target 127.0.0.1:22");
+
+        assert!(unit.contains("Environment=RUST_LOG=rtunnel_agent=warn\n"));
+        assert!(
+            unit.contains("ExecStart=/usr/local/bin/rtunnel host --target 127.0.0.1:22\n"),
+            "{unit}"
+        );
     }
 }

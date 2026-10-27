@@ -1,5 +1,11 @@
 # Decisions and Assumptions Log
 
+## 2026-10-27 — Unattended Host Service
+- **Configured Logging**: The generated Linux host unit sets `Environment=RUST_LOG=rtunnel_agent=warn`, and the macOS launchd plist mirrors it through `EnvironmentVariables`. The service therefore stays quiet in the journal while still reporting errors.
+- **Service Step After Pairing**: `rtunnel setup` prints the exact `service install` command for the current state directory, but does not install the service itself. A service has no interactive terminal and cannot answer the pairing prompt, so at least one client must have an `Always Allow` grant first.
+- **Explicit State Directory**: The printed command includes the state directory and the absolute binary path, because a supervisor runs as root and `sudo` may not see a user-level `~/.local/bin`.
+- **Documented Flow**: The README covers relay installation, first-time OpenSSH setup on the host and workstation, client setup, pairing, and the optional service in that order.
+
 ## 2026-10-27 — Release Version Derived From the Git Tag
 - **Problem**: `git semver` only creates and pushes tags; it does not edit `Cargo.toml`. The `v0.6.0` release therefore shipped new code that still reported `0.4.0` from `CARGO_PKG_VERSION`, making a successful upgrade look like a failed one.
 - **Single Workspace Version**: All crates now use `version.workspace = true`, with the value in `[workspace.package]`.

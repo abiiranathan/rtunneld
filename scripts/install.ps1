@@ -15,7 +15,7 @@
     Optional one-time enrollment URI printed by `rtunneld token create`.
 
 .PARAMETER Version
-    Release tag to install, for example `v0.6.1`. Defaults to the latest release.
+    Release tag to install, for example `vX.Y.Z`. Defaults to the latest release.
 
 .PARAMETER Target
     Override the release asset target triple. Defaults to the host architecture.
@@ -51,7 +51,7 @@
         "rtunnel://relay.example.com:4433/?fp=<relay_fp>&token=<client_token>"
 
 .EXAMPLE
-    .\install.ps1 -Version v0.6.1 -BinDir "$env:LOCALAPPDATA\Programs\rtunnel"
+    .\install.ps1 -Version vX.Y.Z -BinDir "$env:LOCALAPPDATA\Programs\rtunnel"
 #>
 [CmdletBinding()]
 param(
