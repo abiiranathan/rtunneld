@@ -1,14 +1,19 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::all, clippy::pedantic)]
+// Guard types around the SQLite connection and session maps must be held for
+// the full operation, so dropping them earlier would not reduce lock work.
+#![allow(clippy::significant_drop_tightening)]
 
+pub mod admin;
 pub mod audit;
 pub mod server;
 pub mod store;
 
 use thiserror::Error;
 
+pub use admin::{ADMIN_TOKEN_ENV, AdminConfig, load_or_create_admin_token, run_admin_server};
 pub use audit::AuditLogger;
-pub use server::RelayServer;
+pub use server::{LiveAgent, RelayServer};
 pub use store::{PeerRecord, SqliteStore, TokenRecord};
 
 /// Errors encountered within the relay service.

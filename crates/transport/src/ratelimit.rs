@@ -36,14 +36,19 @@ impl RateLimiter {
         let (tokens, last_refill) = lock.entry(ip).or_insert((self.capacity, now));
 
         let elapsed = now.duration_since(*last_refill).as_secs_f64();
-        *tokens = (*tokens + elapsed * self.refill_rate).min(self.capacity);
+        *tokens = elapsed
+            .mul_add(self.refill_rate, *tokens)
+            .min(self.capacity);
         *last_refill = now;
 
-        if *tokens >= 1.0 {
+        let allowed = if *tokens >= 1.0 {
             *tokens -= 1.0;
             true
         } else {
             false
-        }
+        };
+        drop(lock);
+
+        allowed
     }
 }

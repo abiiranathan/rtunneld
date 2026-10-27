@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::all, clippy::pedantic)]
+// Mutex guards are held for the whole DB/session operation by design.
+#![allow(clippy::significant_drop_tightening)]
 
 //! QUIC relay coordinator for `rtunneld`.
 //!
@@ -59,9 +61,26 @@ struct AgentSession {
     fingerprint: String,
     /// Most recent targets advertised by this agent connection.
     targets: Vec<String>,
+    /// When the agent registered this connection.
+    connected_at: Instant,
     /// Control stream send half, held so the stream stays open for the
     /// lifetime of the session.
     _ctrl_send: SendStream,
+}
+
+/// Snapshot of an agent that is currently connected to the relay.
+#[derive(Clone, Debug)]
+pub struct LiveAgent {
+    /// Agent or Device ID name.
+    pub name: String,
+    /// Pinned certificate fingerprint of the agent.
+    pub fingerprint: String,
+    /// Targets advertised by this live connection.
+    pub targets: Vec<String>,
+    /// Remote address of the agent's QUIC connection.
+    pub remote_addr: SocketAddr,
+    /// Seconds since the agent registered this connection.
+    pub connected_secs: u64,
 }
 
 /// Borrowed view of a `PairRequest` frame plus the authenticated identity of
@@ -231,8 +250,34 @@ impl RelayServer {
 
     /// Returns the local bound listening socket address.
     #[must_use]
-    pub fn local_addr(&self) -> SocketAddr {
+    pub const fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// Returns a snapshot of every agent currently connected to the relay.
+    ///
+    /// The result is sorted by agent name so the admin UI renders stably.
+    pub async fn live_agents(&self) -> Vec<LiveAgent> {
+        let agents = self.agents.read().await;
+        let mut live: Vec<LiveAgent> = agents
+            .iter()
+            .map(|(name, session)| LiveAgent {
+                name: name.clone(),
+                fingerprint: session.fingerprint.clone(),
+                targets: session.targets.clone(),
+                remote_addr: session.connection.remote_address(),
+                connected_secs: session.connected_at.elapsed().as_secs(),
+            })
+            .collect();
+        live.sort_by(|a, b| a.name.cmp(&b.name));
+        live
+    }
+
+    /// Returns the Device IDs of hosts currently waiting for pairing prompts.
+    pub async fn live_pairing_hosts(&self) -> Vec<String> {
+        let mut hosts: Vec<String> = self.pairing_hosts.read().await.keys().cloned().collect();
+        hosts.sort();
+        hosts
     }
 
     /// Runs the main relay listening loop and background revocation supervisor.
@@ -927,6 +972,7 @@ impl RelayServer {
             connection: connection.clone(),
             fingerprint: peer.fingerprint.clone(),
             targets: Vec::new(),
+            connected_at: Instant::now(),
             _ctrl_send: ctrl_send,
         };
 

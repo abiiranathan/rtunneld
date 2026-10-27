@@ -193,7 +193,7 @@ impl TofuServerVerifier {
     /// Creates a TOFU verifier that accepts any valid self-signed server certificate
     /// and records its SPKI fingerprint.
     #[must_use]
-    pub fn new(observed_fingerprint: Arc<Mutex<Option<String>>>) -> Self {
+    pub const fn new(observed_fingerprint: Arc<Mutex<Option<String>>>) -> Self {
         Self {
             expected_fingerprint: None,
             observed_fingerprint,

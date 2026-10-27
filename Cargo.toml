@@ -19,6 +19,7 @@ license = "MIT"
 
 [workspace.dependencies]
 anyhow = "1.0"
+axum = "0.8"
 assert_cmd = "2.0"
 base64 = "0.22"
 bytes = "1.10"

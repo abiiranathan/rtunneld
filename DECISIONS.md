@@ -1,5 +1,13 @@
 # Decisions and Assumptions Log
 
+## 2026-10-27 — Server-Side Relay Admin Console
+- **Embedded in the Relay**: The console runs inside `rtunneld serve` and reads the live in-memory agent registry, so it can show connected agents and pairing state without a second process. Nothing about relay operation is exposed to clients; there is no client-served management API.
+- **Read-Mostly Scope**: The console can inspect peers, grants, tokens, and audit events, and can revoke a peer, remove a grant, or revoke a token. It cannot create peers, tokens, or grants, so enrollment and authorization keep their existing audited CLI and host-pairing paths.
+- **Token Authentication**: A random admin token is created in `admin.token` with `0600` permissions. `RTUNNEL_ADMIN_TOKEN` and `--admin-token` override the file, and the token is never printed or logged.
+- **Session Security**: Browser sessions use random `HttpOnly`, `SameSite=Strict` cookies with a 12-hour lifetime. Mutating actions require a per-session CSRF token, and failed logins are rate-limited per source IP.
+- **Loopback Default**: The console listens on `127.0.0.1:8080` unless `--admin-listen` says otherwise; remote access is through an SSH tunnel or a TLS-terminating reverse proxy. `--no-admin` disables it for installs that do not need it.
+- **Server-Rendered UI**: axum 0.8 serves embedded HTML and CSS with no client-side framework or build step, keeping the relay binary self-contained.
+
 ## 2026-10-27 — Unattended Host Service
 - **Configured Logging**: The generated Linux host unit sets `Environment=RUST_LOG=rtunnel_agent=warn`, and the macOS launchd plist mirrors it through `EnvironmentVariables`. The service therefore stays quiet in the journal while still reporting errors.
 - **Service Step After Pairing**: `rtunnel setup` prints the exact `service install` command for the current state directory, but does not install the service itself. A service has no interactive terminal and cannot answer the pairing prompt, so at least one client must have an `Always Allow` grant first.

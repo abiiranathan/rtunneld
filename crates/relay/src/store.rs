@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::all, clippy::pedantic)]
+// Mutex guards are held for the whole DB/session operation by design.
+#![allow(clippy::significant_drop_tightening)]
 
 use rand::Rng;
 use rusqlite::{Connection, OptionalExtension, Result as SqliteResult, params};

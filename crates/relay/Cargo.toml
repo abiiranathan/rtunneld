@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
+axum = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
 quinn = { workspace = true }
@@ -32,3 +33,6 @@ rtunnel-proto = { path = "../proto" }
 rtunnel-identity = { path = "../identity" }
 rtunnel-install = { path = "../install" }
 rtunnel-transport = { path = "../transport" }
+
+[dev-dependencies]
+tempfile = { workspace = true }

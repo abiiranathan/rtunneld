@@ -195,4 +195,22 @@ impl AuditLogger {
             action: None,
         });
     }
+
+    /// Logs the removal of a pending enrollment token.
+    pub fn log_token_revoke(&self, token_hash: &str) {
+        self.write_record(&AuditRecord {
+            timestamp: Utc::now().to_rfc3339(),
+            event: "token_revoke",
+            client: None,
+            agent: None,
+            target: Some(token_hash),
+            session_id: None,
+            bytes_up: None,
+            bytes_down: None,
+            duration_ms: None,
+            reason: None,
+            fingerprint: None,
+            action: None,
+        });
+    }
 }

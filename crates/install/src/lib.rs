@@ -152,7 +152,7 @@ pub fn add_to_user_path(dir: &Path) -> io::Result<bool> {
 /// Never returns an error on non-Windows platforms.
 #[cfg(not(windows))]
 #[allow(clippy::unnecessary_wraps)]
-pub fn add_to_user_path(_dir: &Path) -> io::Result<bool> {
+pub const fn add_to_user_path(_dir: &Path) -> io::Result<bool> {
     Ok(false)
 }
 

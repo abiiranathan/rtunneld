@@ -291,6 +291,39 @@ ssh <user>@482913077
 
 ## 8. Relay administration
 
+### Web console
+
+The relay serves a read-mostly operator console on `127.0.0.1:8080` by default.
+It shows connected agents and their advertised targets, peers, grants, active
+enrollment tokens, and recent audit events. From the console you can revoke a
+peer, remove a grant, or revoke an enrollment token. Creating peers, tokens, or
+grants stays on the host and in the CLI, so enrollment always goes through an
+audited path.
+
+The console binds to loopback. To use it from your workstation, forward the port
+over SSH:
+
+```bash
+ssh -L 8080:127.0.0.1:8080 -N root@relay.example.com
+```
+
+Then open <http://127.0.0.1:8080>. Sign in with the admin token, which is
+created on first install or start and stored with `0600` permissions:
+
+```bash
+sudo cat /var/lib/rtunnel/admin.token
+```
+
+Change the token by replacing that file or by setting `RTUNNEL_ADMIN_TOKEN` in
+the service environment, then restart `rtunneld`.
+
+To expose the console through a reverse proxy, terminate TLS at the proxy and
+keep the relay's admin listener on loopback. Do not bind it to a public
+interface. To disable the console entirely, add `--no-admin` to the `ExecStart`
+line or pass `--no-admin` when running `rtunneld install`.
+
+### Command line
+
 Run these on the relay host:
 
 ```bash
@@ -369,6 +402,10 @@ ssh <user>@clinic-a
   and session data remain encrypted end to end.
 - **Restricted agent targets**: even a compromised relay cannot make
   `rtunnel-agent` dial an unlisted destination.
+- **Admin console on loopback**: the web console listens on `127.0.0.1` by
+  default, uses an admin token stored with `0600` permissions, and issues
+  `HttpOnly`, `SameSite=Strict` session cookies with CSRF-protected actions.
+  Reach it through an SSH tunnel or a TLS-terminating proxy.
 - **Private key permissions**: identities are stored with `0600` modes on Unix.
 
 ---

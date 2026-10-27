@@ -8,7 +8,10 @@ use rtunnel_identity::{
     EnrollmentUri, KeyMaterial, generate_identity, hex_encode, is_valid_name, load_identity,
     save_identity,
 };
-use rtunnel_relay::{AuditLogger, RelayServer, SqliteStore};
+use rtunnel_relay::{
+    ADMIN_TOKEN_ENV, AdminConfig, AuditLogger, RelayServer, SqliteStore,
+    load_or_create_admin_token, run_admin_server,
+};
 use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -48,6 +51,13 @@ enum Command {
         state_dir: PathBuf,
         #[arg(long, default_value = "0.0.0.0:4433")]
         listen: SocketAddr,
+        /// Address for the operator web console. Bind to localhost unless a
+        /// TLS-terminating reverse proxy fronts it.
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        admin_listen: SocketAddr,
+        /// Do not run the operator web console.
+        #[arg(long)]
+        no_admin: bool,
         /// Install the unit without enabling or starting the service.
         #[arg(long)]
         no_start: bool,
@@ -58,6 +68,16 @@ enum Command {
         state_dir: PathBuf,
         #[arg(long, default_value = "0.0.0.0:4433")]
         listen: SocketAddr,
+        /// Address for the operator web console. Bind to localhost unless a
+        /// TLS-terminating reverse proxy fronts it.
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        admin_listen: SocketAddr,
+        /// Do not run the operator web console.
+        #[arg(long)]
+        no_admin: bool,
+        /// Admin token override. Prefer `RTUNNEL_ADMIN_TOKEN` or `admin.token`.
+        #[arg(long)]
+        admin_token: Option<String>,
     },
     /// Manage single-use enrollment tokens.
     Token {
@@ -214,6 +234,8 @@ fn install_relay(
     bin_dir: &Path,
     state_dir: &Path,
     listen: SocketAddr,
+    admin_listen: SocketAddr,
+    no_admin: bool,
     no_start: bool,
 ) -> Result<()> {
     rtunnel_install::ensure_root()
@@ -235,11 +257,25 @@ fn install_relay(
         initialize_state(state_dir)?
     };
 
-    let exec_start = format!(
+    if !no_admin {
+        load_or_create_admin_token(state_dir).with_context(|| {
+            format!(
+                "failed to prepare {}",
+                state_dir.join("admin.token").display()
+            )
+        })?;
+    }
+
+    let mut exec_start = format!(
         "{} serve --state-dir {} --listen {listen}",
         installed.display(),
         state_dir.display()
     );
+    if no_admin {
+        exec_start.push_str(" --no-admin");
+    } else {
+        exec_start = format!("{exec_start} --admin-listen {admin_listen}");
+    }
     let unit = rtunnel_install::render_unit(RELAY_UNIT_TEMPLATE, &exec_start, state_dir);
     let unit_path = rtunnel_install::install_unit("rtunneld.service", &unit)
         .context("failed to install rtunneld.service")?;
@@ -247,6 +283,14 @@ fn install_relay(
     println!("Installed rtunneld at {}", installed.display());
     println!("Systemd unit: {}", unit_path.display());
     println!("Relay fingerprint: {}", identity.fingerprint);
+    if no_admin {
+        println!("Admin console: disabled");
+    } else {
+        println!("Admin console: http://{admin_listen}");
+        println!("Admin token:   {}", state_dir.join("admin.token").display());
+        let admin_port = admin_listen.port();
+        println!("Remote access: ssh -L {admin_port}:127.0.0.1:{admin_port} -N root@<relay-host>");
+    }
 
     if no_start {
         println!("Service not started (--no-start).");
@@ -301,11 +345,26 @@ async fn main() -> Result<()> {
             bin_dir,
             state_dir,
             listen,
+            admin_listen,
+            no_admin,
             no_start,
         } => {
-            install_relay(&bin_dir, &state_dir, listen, no_start)?;
+            install_relay(
+                &bin_dir,
+                &state_dir,
+                listen,
+                admin_listen,
+                no_admin,
+                no_start,
+            )?;
         }
-        Command::Serve { state_dir, listen } => {
+        Command::Serve {
+            state_dir,
+            listen,
+            admin_listen,
+            no_admin,
+            admin_token,
+        } => {
             let id = load_identity(&state_dir)
                 .context("could not load relay identity; run rtunneld init first")?;
 
@@ -313,7 +372,53 @@ async fn main() -> Result<()> {
             let audit = Arc::new(AuditLogger::open(&state_dir)?);
 
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
-            let server = Arc::new(RelayServer::new(listen, &id, db, audit, shutdown_rx)?);
+            let server = Arc::new(RelayServer::new(
+                listen,
+                &id,
+                Arc::clone(&db),
+                Arc::clone(&audit),
+                shutdown_rx.clone(),
+            )?);
+
+            if !no_admin {
+                let token = match admin_token {
+                    Some(token) if !token.trim().is_empty() => token,
+                    _ => load_or_create_admin_token(&state_dir).with_context(|| {
+                        format!(
+                            "failed to prepare {}",
+                            state_dir.join("admin.token").display()
+                        )
+                    })?,
+                };
+                println!("Admin console: http://{admin_listen}");
+                println!(
+                    "Admin token:   {} (or set {ADMIN_TOKEN_ENV})",
+                    state_dir.join("admin.token").display()
+                );
+
+                let admin_config = AdminConfig {
+                    listen: admin_listen,
+                    token,
+                    state_dir: state_dir.clone(),
+                };
+                let admin_relay = Arc::clone(&server);
+                let admin_store = Arc::clone(&db);
+                let admin_audit = Arc::clone(&audit);
+                let admin_shutdown = shutdown_rx.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = run_admin_server(
+                        admin_config,
+                        admin_relay,
+                        admin_store,
+                        admin_audit,
+                        admin_shutdown,
+                    )
+                    .await
+                    {
+                        eprintln!("rtunneld: admin console stopped: {error}");
+                    }
+                });
+            }
 
             tokio::spawn(async move {
                 let _ = tokio::signal::ctrl_c().await;

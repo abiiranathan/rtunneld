@@ -101,7 +101,7 @@ impl Backoff {
     }
 
     /// Resets the backoff attempt counter after a connection is stable.
-    pub fn reset(&mut self) {
+    pub const fn reset(&mut self) {
         self.current_attempt = 0;
     }
 }
