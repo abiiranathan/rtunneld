@@ -225,6 +225,24 @@ The installer places `rtunnel` in `/usr/local/bin` when run as root,
 `~/.local/bin` for normal users, and `%LOCALAPPDATA%\Programs\rtunnel` on
 Windows. Make sure that directory is on your `PATH` before continuing.
 
+> **SSH prerequisite:** `rtunnel` only transports TCP; it does not install or
+> configure `sshd`, create users, or manage SSH credentials. Before relying on
+> it, the host must already run an OpenSSH server and the target account must
+> accept a login method you can use (a public key is recommended). Prepare that
+> once through the machine's local console, a cloud-provider console, cloud-init,
+> or an existing SSH/LAN session:
+>
+> ```bash
+> # On the host
+> sudo apt install openssh-server        # Debian/Ubuntu
+> sudo systemctl enable --now ssh
+> ```
+>
+> Then add your workstation's public key to the target user's
+> `~/.ssh/authorized_keys`. After this one-time setup, `rtunnel` removes the need
+> for a public IP, port forwarding, or an inbound firewall rule, but SSH still
+> authenticates the user end to end.
+
 ### Step 1: Run Setup on Both Endpoints
 
 Run setup **once on each endpoint** (host and workstation). Replace
