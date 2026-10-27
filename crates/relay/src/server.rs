@@ -22,9 +22,9 @@ use rtunnel_transport::{
     make_server_config, read_frame, splice_quic_streams, write_frame,
 };
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, watch};
 use tracing::{debug, info, warn};
@@ -38,8 +38,18 @@ const UNKNOWN_CLIENT_ID: &str = "unknown";
 /// Number of random bytes used to build a session or pairing-session ID.
 const SESSION_ID_BYTES: usize = 16;
 
+/// How long an "Allow Once" pairing approval authorizes a client to connect.
+///
+/// The approval has to survive the short gap between the pairing stream and the
+/// follow-up `ConnectRequest`, but it is intentionally not persisted.
+const ONCE_GRANT_TTL: Duration = Duration::from_mins(5);
+
 /// Shared registry of currently connected agents, keyed by agent name.
 type AgentMap = Arc<RwLock<HashMap<String, AgentSession>>>;
+
+/// Hosts that are online and accepting interactive pairing prompts, keyed by
+/// Device ID. Their target sessions are served by a separate tunnel connection.
+type PairingHostMap = Arc<RwLock<HashMap<String, Connection>>>;
 
 /// A live agent connection tracked by the relay.
 struct AgentSession {
@@ -84,6 +94,10 @@ pub struct RelayServer {
     audit: Arc<AuditLogger>,
     /// Currently connected agents, keyed by agent name.
     agents: AgentMap,
+    /// Connected `rtunnel host` rendezvous sessions, keyed by Device ID.
+    pairing_hosts: PairingHostMap,
+    /// Non-persistent "Allow Once" grants, keyed by `(client, agent)`.
+    once_grants: Mutex<HashMap<(String, String), Instant>>,
     /// Rate limiter for authenticated tunnel connections.
     normal_limiter: RateLimiter,
     /// Rate limiter for enrollment connections.
@@ -180,9 +194,13 @@ impl RelayServer {
             &identity.certificate_der,
             &identity.private_key_pem,
             client_verifier,
+            // rustls applies the server's preference order. Rendezvous must win
+            // when a peer offers both: `rtunnel setup` registers a Device ID,
+            // which the authenticated tunnel handler would reject because the
+            // peer is not enrolled yet.
             vec![
-                ALPN_TUNNEL.to_vec(),
                 ALPN_RENDEZVOUS.to_vec(),
+                ALPN_TUNNEL.to_vec(),
                 ALPN_ENROLL.to_vec(),
             ],
         )
@@ -202,6 +220,8 @@ impl RelayServer {
             store,
             audit,
             agents: Arc::new(RwLock::new(HashMap::new())),
+            pairing_hosts: Arc::new(RwLock::new(HashMap::new())),
+            once_grants: Mutex::new(HashMap::new()),
             normal_limiter: RateLimiter::new(20, 10),
             enroll_limiter: RateLimiter::new(5, 1),
             rendezvous_limiter: RateLimiter::new(10, 5),
@@ -388,8 +408,12 @@ impl RelayServer {
             }
         };
 
+        // The Device ID this connection registered, if any. A `rtunnel host`
+        // connection is addressable for pairing prompts while it stays open.
+        let mut registered_device: Option<String> = None;
+
         loop {
-            let (mut send, mut recv) = match connection.accept_bi().await {
+            let (send, mut recv) = match connection.accept_bi().await {
                 Ok(streams) => streams,
                 Err(e) => {
                     debug!(error = %e, "rendezvous connection closed");
@@ -404,87 +428,161 @@ impl RelayServer {
                 }
             };
 
-            match msg {
-                ControlMessage::RegisterDevice { label, .. } => {
-                    self.handle_register_device(&mut send, &peer_fp, &label)
-                        .await;
-                }
-                ControlMessage::SetPairingCode {
-                    code_hash,
-                    ttl_secs,
-                } => {
-                    let device_id = match self.registered_peer_name(&peer_fp) {
-                        Ok(name) => name,
-                        Err(code) => {
-                            send_error(&mut send, code, "device not registered or lookup failed")
-                                .await;
-                            continue;
-                        }
-                    };
+            if let Some(device_id) = self
+                .handle_rendezvous_message(msg, send, recv, &peer_fp)
+                .await
+            {
+                self.pairing_hosts
+                    .write()
+                    .await
+                    .insert(device_id.clone(), connection.clone());
+                registered_device = Some(device_id);
+            }
+        }
 
-                    match self
-                        .store
-                        .set_pairing_code(&device_id, &code_hash, ttl_secs)
-                    {
-                        Ok(..) => {
-                            info!(device_id = %device_id, "updated pairing code");
-                            finish_logged(&mut send, "SetPairingCode");
-                        }
-                        Err(e) => {
-                            send_error(&mut send, ErrorCode::Internal, e.to_string()).await;
-                        }
+        // Remove only this connection's entry: a newer host session may already
+        // have replaced it with the same Device ID.
+        if let Some(device_id) = registered_device {
+            let mut hosts = self.pairing_hosts.write().await;
+            if hosts
+                .get(&device_id)
+                .is_some_and(|current| current.stable_id() == connection.stable_id())
+            {
+                hosts.remove(&device_id);
+            }
+        }
+    }
+
+    /// Dispatches one frame received on a rendezvous connection.
+    ///
+    /// Returns the Device ID when the frame registered a host, so the caller can
+    /// publish the connection in the pairing-host registry.
+    async fn handle_rendezvous_message(
+        &self,
+        message: ControlMessage,
+        mut send: SendStream,
+        recv: RecvStream,
+        peer_fp: &str,
+    ) -> Option<String> {
+        match message {
+            ControlMessage::RegisterDevice { label, .. } => {
+                self.handle_register_device(&mut send, peer_fp, &label)
+                    .await
+            }
+            ControlMessage::SetPairingCode {
+                code_hash,
+                ttl_secs,
+            } => {
+                let device_id = match self.registered_peer_name(peer_fp) {
+                    Ok(name) => name,
+                    Err(code) => {
+                        send_error(&mut send, code, "device not registered or lookup failed").await;
+                        return None;
+                    }
+                };
+
+                match self
+                    .store
+                    .set_pairing_code(&device_id, &code_hash, ttl_secs)
+                {
+                    Ok(..) => {
+                        info!(device_id = %device_id, "updated pairing code");
+                        finish_logged(&mut send, "SetPairingCode");
+                    }
+                    Err(e) => {
+                        send_error(&mut send, ErrorCode::Internal, e.to_string()).await;
                     }
                 }
-                ControlMessage::PairRequest {
-                    target_device_id,
-                    code,
-                    client_label,
-                    ssh_pubkey,
-                } => {
-                    let attempt = PairingAttempt {
-                        client_fp: &peer_fp,
-                        raw_target_id: &target_device_id,
-                        code: &code,
-                        client_label: &client_label,
-                        ssh_pubkey: ssh_pubkey.as_deref(),
-                    };
-                    self.process_pairing_request(&mut send, &attempt).await;
-                }
-                ControlMessage::ConnectRequest { agent, target } => {
-                    let client_id = match self.registered_peer_name(&peer_fp) {
-                        Ok(name) => name,
-                        Err(code) => {
-                            send_connect_response(&mut send, "", ResultStatus::Err(code)).await;
-                            continue;
-                        }
-                    };
-                    self.process_connect_request(send, recv, &client_id, &agent, target.as_ref())
-                        .await;
-                }
-                other => {
-                    send_error(
-                        &mut send,
-                        ErrorCode::ProtocolViolation,
-                        format!("unexpected rendezvous message: {other:?}"),
-                    )
+                None
+            }
+            ControlMessage::PairRequest {
+                target_device_id,
+                code,
+                client_label,
+                ssh_pubkey,
+            } => {
+                let attempt = PairingAttempt {
+                    client_fp: peer_fp,
+                    raw_target_id: &target_device_id,
+                    code: &code,
+                    client_label: &client_label,
+                    ssh_pubkey: ssh_pubkey.as_deref(),
+                };
+                self.process_pairing_request(&mut send, &attempt).await;
+                None
+            }
+            ControlMessage::ConnectRequest { agent, target } => {
+                let client_id = match self.registered_peer_name(peer_fp) {
+                    Ok(name) => name,
+                    Err(code) => {
+                        send_connect_response(&mut send, "", ResultStatus::Err(code)).await;
+                        return None;
+                    }
+                };
+                self.process_connect_request(send, recv, &client_id, &agent, target.as_ref())
                     .await;
-                }
+                None
+            }
+            ControlMessage::ListAgents { .. } => {
+                let client_id = match self.registered_peer_name(peer_fp) {
+                    Ok(name) => name,
+                    Err(code) => {
+                        send_error(&mut send, code, "device not registered").await;
+                        return None;
+                    }
+                };
+                self.handle_list_agents(&mut send, &client_id).await;
+                None
+            }
+            ControlMessage::ListAgentsDetailed { .. } => {
+                let client_id = match self.registered_peer_name(peer_fp) {
+                    Ok(name) => name,
+                    Err(code) => {
+                        send_error(&mut send, code, "device not registered").await;
+                        return None;
+                    }
+                };
+                self.handle_list_agents_detailed(&mut send, &client_id)
+                    .await;
+                None
+            }
+            other => {
+                send_error(
+                    &mut send,
+                    ErrorCode::ProtocolViolation,
+                    format!("unexpected rendezvous message: {other:?}"),
+                )
+                .await;
+                None
             }
         }
     }
 
     /// Allocates (or returns the existing) device ID for the peer with
     /// fingerprint `peer_fp` and replies with `RegisterDeviceAck`.
-    async fn handle_register_device(&self, send: &mut SendStream, peer_fp: &str, label: &str) {
+    ///
+    /// Returns the Device ID that was registered, or `None` if the store failed.
+    async fn handle_register_device(
+        &self,
+        send: &mut SendStream,
+        peer_fp: &str,
+        label: &str,
+    ) -> Option<String> {
         match self.store.get_or_allocate_device_id(peer_fp, label) {
             Ok(device_id) => {
                 info!(device_id = %device_id, label = %label, "allocated device id");
-                let resp = ControlMessage::RegisterDeviceAck { device_id };
-                write_logged(send, &resp, "RegisterDeviceAck").await;
+                let resp = ControlMessage::RegisterDeviceAck {
+                    device_id: device_id.clone(),
+                };
+                if !write_logged(send, &resp, "RegisterDeviceAck").await {
+                    return None;
+                }
                 finish_logged(send, "RegisterDeviceAck");
+                Some(device_id)
             }
             Err(e) => {
                 send_error(send, ErrorCode::Internal, e.to_string()).await;
+                None
             }
         }
     }
@@ -516,7 +614,10 @@ impl RelayServer {
         attempt: &PairingAttempt<'_>,
     ) {
         let target_device_id = normalize_device_id(attempt.raw_target_id);
-        let error = self.run_pairing(attempt, &target_device_id).await.err();
+        let error = self
+            .run_pairing(client_send, attempt, &target_device_id)
+            .await
+            .err();
         send_pair_result(client_send, &target_device_id, error).await;
     }
 
@@ -530,26 +631,41 @@ impl RelayServer {
     /// operation fails.
     async fn run_pairing(
         &self,
+        client_send: &mut SendStream,
         attempt: &PairingAttempt<'_>,
         target_device_id: &str,
     ) -> Result<(), ErrorCode> {
         let host_peer = self.lookup_active_host(target_device_id)?;
         self.verify_pairing_code(attempt, target_device_id)?;
 
-        // Clone the connection so the agents lock is not held across awaits.
+        // Pairing prompts travel over the host's rendezvous connection, while
+        // target sessions use its separate tunnel connection in `agents`.
         let host_conn = self
-            .agents
+            .pairing_hosts
             .read()
             .await
             .get(target_device_id)
-            .map(|s| s.connection.clone())
+            .cloned()
             .ok_or(ErrorCode::AgentOffline)?;
 
         let client_id = self.resolve_client_id(attempt.client_fp)?;
 
         let pair_session_id = hex_encode(&rand::random::<[u8; SESSION_ID_BYTES]>());
+        let sas = compute_sas(attempt.client_fp, &host_peer.fingerprint, &pair_session_id);
+
+        // Tell the client the SAS before the host is asked, so both operators
+        // can compare the code out of band while the request is pending.
+        let pending = ControlMessage::PairPending {
+            pair_session_id: pair_session_id.clone(),
+            sas: sas.clone(),
+            host_device_id: target_device_id.to_owned(),
+        };
+        if !write_logged(client_send, &pending, "PairPending").await {
+            return Err(ErrorCode::AgentOffline);
+        }
+
         let prompt = ControlMessage::IncomingPairPrompt {
-            sas: compute_sas(attempt.client_fp, &host_peer.fingerprint, &pair_session_id),
+            sas,
             pair_session_id: pair_session_id.clone(),
             client_id: client_id.clone(),
             client_label: attempt.client_label.to_owned(),
@@ -568,17 +684,45 @@ impl RelayServer {
             }
         };
 
-        if duration == GrantDuration::Always {
-            self.store
-                .add_grant(&client_id, target_device_id)
-                .map_err(|e| {
-                    warn!(client = %client_id, host = %target_device_id, error = %e, "failed to persist grant");
-                    ErrorCode::Internal
-                })?;
+        match duration {
+            GrantDuration::Always => {
+                self.store
+                    .add_grant(&client_id, target_device_id)
+                    .map_err(|e| {
+                        warn!(client = %client_id, host = %target_device_id, error = %e, "failed to persist grant");
+                        ErrorCode::Internal
+                    })?;
+            }
+            GrantDuration::Once => {
+                self.remember_once_grant(&client_id, target_device_id);
+            }
         }
         self.audit
             .log_grant_change("pair_approved", &client_id, target_device_id);
         Ok(())
+    }
+
+    /// Records a short-lived "Allow Once" grant in memory.
+    fn remember_once_grant(&self, client_id: &str, target_device_id: &str) {
+        let mut grants = self
+            .once_grants
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        grants.insert(
+            (client_id.to_owned(), target_device_id.to_owned()),
+            Instant::now() + ONCE_GRANT_TTL,
+        );
+    }
+
+    /// Returns `true` when a live in-memory "Allow Once" grant exists.
+    fn has_once_grant(&self, client_id: &str, target_device_id: &str) -> bool {
+        let now = Instant::now();
+        let mut grants = self
+            .once_grants
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        grants.retain(|_, expires_at| *expires_at > now);
+        grants.contains_key(&(client_id.to_owned(), target_device_id.to_owned()))
     }
 
     /// Looks up the host peer registered under `device_id`.
@@ -966,13 +1110,41 @@ impl RelayServer {
     ///
     /// [`ErrorCode::Internal`] if the grant lookup fails.
     fn granted_agents(&self, client_name: &str) -> Result<Vec<String>, ErrorCode> {
-        self.store
-            .list_grants(Some(client_name))
-            .map(|grants| grants.into_iter().map(|(_, agent)| agent).collect())
-            .map_err(|e| {
-                warn!(client = %client_name, error = %e, "grant lookup failed");
-                ErrorCode::Internal
-            })
+        let persisted = self.store.list_grants(Some(client_name)).map_err(|e| {
+            warn!(client = %client_name, error = %e, "grant lookup failed");
+            ErrorCode::Internal
+        })?;
+
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut agents: Vec<String> = Vec::new();
+        for (_, agent) in persisted {
+            if seen.insert(agent.clone()) {
+                agents.push(agent);
+            }
+        }
+
+        // Surface live "Allow Once" grants too, so `rtunnel agents` and
+        // `rtunnel ssh-config --all --write` work immediately after pairing.
+        let now = Instant::now();
+        let mut grants = self
+            .once_grants
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        grants.retain(|_, expires_at| *expires_at > now);
+        let mut once_agents: Vec<String> = grants
+            .keys()
+            .filter(|(client, _)| client == client_name)
+            .map(|(_, agent)| agent.clone())
+            .collect();
+        once_agents.sort();
+        drop(grants);
+        for agent in once_agents {
+            if seen.insert(agent.clone()) {
+                agents.push(agent);
+            }
+        }
+        agents.sort();
+        Ok(agents)
     }
 
     /// Returns the targets persisted for `agent`, or an empty list (after
@@ -1070,6 +1242,7 @@ impl RelayServer {
     fn authorize_connect(&self, client_name: &str, agent_name: &str) -> Result<(), ErrorCode> {
         match self.store.has_grant(client_name, agent_name) {
             Ok(true) => Ok(()),
+            Ok(false) if self.has_once_grant(client_name, agent_name) => Ok(()),
             Ok(false) => {
                 self.audit
                     .log_auth_failure(client_name, "grant missing for target agent");

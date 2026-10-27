@@ -8,21 +8,22 @@ use directories::BaseDirs;
 use directories::ProjectDirs;
 use quinn::Connection;
 use rand::Rng;
+use rtunnel_agent::{AgentConfig, AgentRunner};
 use rtunnel_client::ClientConfig;
 use rtunnel_identity::{
     EnrollmentUri, KeyMaterial, PinnedServerVerifier, TofuServerVerifier, generate_identity,
-    is_valid_name, load_identity, save_identity,
+    hex_encode, is_valid_name, load_identity, save_identity,
 };
 use rtunnel_proto::{
-    ALPN_ENROLL, ALPN_RENDEZVOUS, ALPN_TUNNEL, AgentDetail, ControlMessage, ErrorCode,
-    GrantDuration, HostPort, ResultStatus, format_device_id, normalize_device_id,
+    ALPN_ENROLL, ALPN_RENDEZVOUS, AgentDetail, ControlMessage, ErrorCode, GrantDuration, HostPort,
+    ResultStatus, format_device_id, normalize_device_id,
 };
 use rtunnel_transport::{
     create_client_endpoint, make_client_config, read_frame, splice_quic_to_stdio, write_frame,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
-use std::io::{BufRead, Write};
+use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -35,6 +36,9 @@ const EXIT_FAILURE: i32 = 1;
 /// Default relay host if not configured in environment or CLI.
 const DEFAULT_RELAY_HOST: &str = "relay.example.com";
 const DEFAULT_RELAY_PORT: u16 = 4433;
+
+/// Lifetime of the host's ephemeral pairing code.
+const PAIRING_CODE_TTL_SECS: u32 = 900;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -62,7 +66,7 @@ enum Command {
         #[arg(long)]
         relay_fingerprint: Option<String>,
     },
-    /// Print local Device ID and active one-time pairing code.
+    /// Print the local Device ID and state directory.
     Id,
     /// Connect to a remote machine by Device ID or alias.
     Connect {
@@ -74,8 +78,12 @@ enum Command {
         /// Optional destination port or host:port on the agent LAN.
         dest: Option<String>,
     },
-    /// Run the background host service for this device.
-    Host,
+    /// Run the background host daemon for this device.
+    Host {
+        /// Local destination that inbound sessions may dial (defaults to SSH).
+        #[arg(long, default_value = "127.0.0.1:22")]
+        target: String,
+    },
     /// Manage the background system service (systemd/launchd/Windows Service).
     Service {
         #[command(subcommand)]
@@ -124,6 +132,9 @@ enum ServiceCommand {
     Install {
         #[arg(long)]
         relay_host: Option<String>,
+        /// Local destination that inbound sessions may dial.
+        #[arg(long, default_value = "127.0.0.1:22")]
+        target: String,
     },
     /// Start host service.
     Start,
@@ -182,10 +193,17 @@ async fn dial_relay(
         vec![alpn.to_vec()],
     )?;
 
+    let handshake_context = if alpn == ALPN_RENDEZVOUS {
+        "relay TLS/QUIC handshake failed; the relay must support rtunnel-rendezvous/1 \
+         (upgrade rtunneld and restart it without deleting its state directory)"
+    } else {
+        "relay TLS/QUIC handshake failed; verify the relay address and pinned fingerprint"
+    };
+
     endpoint
         .connect_with(client_config, relay_addr, host)?
         .await
-        .context("relay TLS/QUIC handshake failed")
+        .context(handshake_context)
 }
 
 fn default_client_bin_dir() -> Result<PathBuf> {
@@ -368,7 +386,10 @@ async fn run_setup(
         &id.certificate_der,
         &id.private_key_pem,
         verifier,
-        vec![ALPN_RENDEZVOUS.to_vec(), ALPN_TUNNEL.to_vec()],
+        // Setup only speaks the rendezvous protocol. Offering the tunnel ALPN
+        // here would let a server that prefers tunnel negotiate it instead,
+        // and the unregistered identity would then be rejected.
+        vec![ALPN_RENDEZVOUS.to_vec()],
     )?;
 
     let relay_addr = lookup_host((relay_host, relay_port))
@@ -380,7 +401,11 @@ async fn run_setup(
     let connection = endpoint
         .connect_with(client_config, relay_addr, relay_host)?
         .await
-        .context("relay TLS/QUIC handshake failed")?;
+        .context(
+            "relay TLS/QUIC handshake failed; verify --relay-fingerprint and ensure the \
+             relay runs an rtunneld build that supports the rtunnel-rendezvous/1 ALPN \
+             (upgrade the relay and restart it without deleting its state directory)",
+        )?;
 
     let captured_relay_fp = observed_fp
         .lock()
@@ -424,6 +449,7 @@ async fn run_setup(
         format_device_id(&device_id)
     );
     println!("Pinned Relay Fingerprint:  {captured_relay_fp}");
+    println!("State Directory:           {}", state_dir.display());
     println!("--------------------------------------------------");
     println!("To allow remote access to this machine:");
     println!("  rtunnel host");
@@ -435,103 +461,252 @@ async fn run_setup(
     Ok(())
 }
 
-/// Runs the host service, awaiting incoming connections or pairing requests.
-async fn run_host(state_dir: &Path) -> Result<()> {
-    let (config, id) = load_client_state(state_dir)?;
+/// Runs the host daemon: one tunnel connection for target sessions and one
+/// rendezvous connection for interactive pairing prompts.
+async fn run_host(state_dir: &Path, target: &str) -> Result<()> {
+    let (mut config, id) = load_client_state(state_dir)?;
+    let target = HostPort::parse(target)
+        .map_err(|_| anyhow!("invalid host target; expected host:port"))?
+        .to_string();
 
-    // Generate a fresh 6-digit one-time access code
-    let mut rng = rand::thread_rng();
-    let access_code: u32 = rng.gen_range(100_000..=999_999);
-    let code_str = access_code.to_string();
-    let code_hash = rtunnel_identity::hex_encode(&Sha256::digest(code_str.as_bytes()));
+    // Generate a fresh 6-digit one-time access code. The host rotates it after
+    // every pairing prompt and on the TTL below, because the relay consumes a
+    // code as soon as it verifies one.
+    let (mut code_str, mut code_hash) = generate_pairing_code();
 
     println!("=== rtunnel Host Daemon Running ===");
     println!("Device ID:   {}", format_device_id(&config.client_name));
     println!("Access Code: {code_str} (valid for 15 minutes)");
+    println!("Allowed target: {target}");
     println!("Ready for inbound connections. Press Ctrl+C to exit.\n");
 
+    // The tunnel connection serves SSH bytes and advertises the allowlist.
+    // AgentRunner owns reconnection, so the host keeps working across restarts.
+    let agent_config = AgentConfig {
+        relay_host: config.relay_host.clone(),
+        relay_port: config.relay_port,
+        relay_fingerprint: config.relay_fingerprint.clone(),
+        agent_name: config.client_name.clone(),
+        allowed_targets: vec![target],
+        max_sessions: 64,
+    };
+    let agent_id = id.clone();
+    tokio::spawn(async move {
+        if let Err(e) = AgentRunner::new(agent_config, agent_id).run().await {
+            eprintln!("rtunnel: host tunnel stopped: {e}");
+        }
+    });
+
+    let mut backoff = std::time::Duration::from_secs(1);
+    loop {
+        match run_host_rendezvous(state_dir, &mut config, &id, &mut code_hash, &mut code_str).await
+        {
+            Ok(()) => eprintln!("rtunnel: relay closed the host rendezvous connection"),
+            Err(e) => eprintln!("rtunnel: host rendezvous connection failed: {e:#}"),
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(std::time::Duration::from_secs(30));
+    }
+}
+
+/// Registers this device, publishes the pairing code, and serves pairing
+/// prompts until the rendezvous connection closes.
+async fn run_host_rendezvous(
+    state_dir: &Path,
+    config: &mut ClientConfig,
+    id: &KeyMaterial,
+    code_hash: &mut String,
+    code_str: &mut String,
+) -> Result<()> {
     let verifier = Arc::new(PinnedServerVerifier::new(&config.relay_fingerprint));
     let connection = dial_relay(
         &config.relay_host,
         config.relay_port,
-        &id,
+        id,
         verifier,
         ALPN_RENDEZVOUS,
     )
     .await?;
 
-    // Announce active pairing code to relay
-    let (mut send, _recv) = connection.open_bi().await?;
-    let set_code = ControlMessage::SetPairingCode {
-        code_hash,
-        ttl_secs: 900,
+    // Register first: this is what makes the rendezvous connection addressable
+    // for pairing prompts. Setup registered the identity earlier, so the relay
+    // returns the same Device ID for the existing fingerprint.
+    let (mut reg_send, mut reg_recv) = connection.open_bi().await?;
+    let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "node".into());
+    let reg_msg = ControlMessage::RegisterDevice {
+        label: hostname,
+        existing_device_id: Some(config.client_name.clone()),
     };
-    write_frame(&mut send, &set_code).await?;
+    write_frame(&mut reg_send, &reg_msg).await?;
+    let device_id = match read_frame(&mut reg_recv).await? {
+        ControlMessage::RegisterDeviceAck { device_id } => device_id,
+        ControlMessage::Error { code, message } => {
+            bail!("relay rejected host registration: {code} - {message}");
+        }
+        _ => bail!("unexpected relay response to host registration"),
+    };
+    if device_id != config.client_name {
+        println!(
+            "Relay assigned Device ID {}; updating local configuration.",
+            format_device_id(&device_id)
+        );
+        config.client_name.clone_from(&device_id);
+        config.save(state_dir)?;
+    }
 
-    // Listen for incoming pairing prompts and target connections
-    while let Ok((mut stream_send, mut stream_recv)) = connection.accept_bi().await {
-        let Ok(msg) = read_frame(&mut stream_recv).await else {
-            continue;
-        };
+    // Publish the one-time access code (the relay stores only its hash).
+    publish_pairing_code(&connection, code_hash).await?;
+    println!("Host online. Access Code: {code_str} (valid for 15 minutes)");
 
-        if let ControlMessage::IncomingPairPrompt {
-            pair_session_id,
-            client_id,
-            client_label,
-            sas,
-            ssh_pubkey,
-        } = msg
-        {
-            println!("--------------------------------------------------");
-            println!("INCOMING PAIRING REQUEST");
-            println!(
-                "Connecting Device: {} ({})",
-                client_label,
-                format_device_id(&client_id)
-            );
-            println!("Authentication Code (SAS): [{sas}]");
-            if ssh_pubkey.is_some() {
-                println!("Client requested SSH Public Key authorization.");
+    // Refresh the code before the relay's TTL expires so an idle host always
+    // has a usable code to show.
+    let mut refresh = tokio::time::interval(std::time::Duration::from_secs(u64::from(
+        PAIRING_CODE_TTL_SECS,
+    )));
+    refresh.tick().await;
+
+    // Only pairing prompts are expected on this connection. SSH target streams
+    // use the separate tunnel connection owned by AgentRunner.
+    loop {
+        tokio::select! {
+            _ = refresh.tick() => {
+                rotate_pairing_code(&connection, code_hash, code_str).await?;
             }
-            println!("--------------------------------------------------");
-            print!("Authorize this device? [1] Allow Once, [2] Always Allow, [3] Deny: ");
-            std::io::stdout().flush().unwrap();
+            accepted = connection.accept_bi() => {
+                let Ok((stream_send, mut stream_recv)) = accepted else {
+                    break;
+                };
+                let Ok(msg) = read_frame(&mut stream_recv).await else {
+                    continue;
+                };
+                if let ControlMessage::IncomingPairPrompt {
+                    pair_session_id,
+                    client_id,
+                    client_label,
+                    sas,
+                    ssh_pubkey,
+                } = msg
+                {
+                    if let Err(e) = handle_pair_prompt(
+                        stream_send,
+                        pair_session_id,
+                        &client_id,
+                        &client_label,
+                        &sas,
+                        ssh_pubkey,
+                    )
+                    .await
+                    {
+                        eprintln!("rtunnel: failed to answer pairing prompt: {e:#}");
+                    }
 
-            let mut input = String::new();
-            let stdin = std::io::stdin();
-            stdin.lock().read_line(&mut input).unwrap();
-            let choice = input.trim();
-
-            let (approved, duration) = match choice {
-                "1" => (true, GrantDuration::Once),
-                "2" => (true, GrantDuration::Always),
-                _ => (false, GrantDuration::Once),
-            };
-
-            let install_key = approved && ssh_pubkey.is_some() && choice == "2";
-            if install_key
-                && let Some(ref key) = ssh_pubkey
-                && let Some(dirs) = BaseDirs::new()
-            {
-                let _ = rtunnel_install::append_authorized_key(dirs.home_dir(), key);
-                println!("Added client SSH key to ~/.ssh/authorized_keys");
-            }
-
-            let resp = ControlMessage::PairPromptResponse {
-                pair_session_id,
-                approved,
-                duration,
-                install_ssh_key: install_key,
-            };
-            let _ = write_frame(&mut stream_send, &resp).await;
-            if approved {
-                println!("Authorized successfully.");
-            } else {
-                println!("Connection request denied.");
+                    // The relay consumes the code while verifying it, even if
+                    // the operator denies the request. Publish a replacement so
+                    // the code shown in this terminal never goes stale.
+                    rotate_pairing_code(&connection, code_hash, code_str).await?;
+                    refresh.reset();
+                }
             }
         }
     }
 
+    Ok(())
+}
+
+/// Generates a random 6-digit access code and its SHA-256 hash.
+fn generate_pairing_code() -> (String, String) {
+    let access_code: u32 = rand::thread_rng().gen_range(100_000..=999_999);
+    let code = access_code.to_string();
+    let hash = hex_encode(&Sha256::digest(code.as_bytes()));
+    (code, hash)
+}
+
+/// Publishes the current pairing-code hash on the rendezvous connection.
+async fn publish_pairing_code(connection: &Connection, code_hash: &str) -> Result<()> {
+    let (mut send, _recv) = connection.open_bi().await?;
+    let set_code = ControlMessage::SetPairingCode {
+        code_hash: code_hash.to_owned(),
+        ttl_secs: PAIRING_CODE_TTL_SECS,
+    };
+    write_frame(&mut send, &set_code).await?;
+    Ok(())
+}
+
+/// Rotates the local code, publishes it, and prints the new value.
+async fn rotate_pairing_code(
+    connection: &Connection,
+    code_hash: &mut String,
+    code_str: &mut String,
+) -> Result<()> {
+    let (new_code, new_hash) = generate_pairing_code();
+    publish_pairing_code(connection, &new_hash).await?;
+    *code_hash = new_hash;
+    *code_str = new_code;
+    println!("New Access Code: {code_str} (valid for 15 minutes)");
+    Ok(())
+}
+
+/// Prompts the local operator and returns their decision to the relay.
+async fn handle_pair_prompt(
+    mut stream_send: quinn::SendStream,
+    pair_session_id: String,
+    client_id: &str,
+    client_label: &str,
+    sas: &str,
+    ssh_pubkey: Option<String>,
+) -> Result<()> {
+    println!("--------------------------------------------------");
+    println!("INCOMING PAIRING REQUEST");
+    println!(
+        "Connecting Device: {} ({})",
+        client_label,
+        format_device_id(client_id)
+    );
+    println!("Authentication Code (SAS): [{sas}]");
+    println!("Verify this code matches the one on the connecting device.");
+    if ssh_pubkey.is_some() {
+        println!("Client requested SSH Public Key authorization.");
+    }
+    println!("--------------------------------------------------");
+    print!("Authorize this device? [1] Allow Once, [2] Always Allow, [3] Deny: ");
+    let _ = std::io::stdout().flush();
+
+    let input = tokio::task::spawn_blocking(|| {
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).map(|_| line)
+    })
+    .await
+    .context("pairing prompt task failed")?
+    .context("cannot read pairing decision from stdin")?;
+    let choice = input.trim();
+
+    let (approved, duration) = match choice {
+        "1" => (true, GrantDuration::Once),
+        "2" => (true, GrantDuration::Always),
+        _ => (false, GrantDuration::Once),
+    };
+
+    let install_key = approved && ssh_pubkey.is_some() && choice == "2";
+    if install_key
+        && let Some(ref key) = ssh_pubkey
+        && let Some(dirs) = BaseDirs::new()
+    {
+        let _ = rtunnel_install::append_authorized_key(dirs.home_dir(), key);
+        println!("Added client SSH key to ~/.ssh/authorized_keys");
+    }
+
+    let resp = ControlMessage::PairPromptResponse {
+        pair_session_id,
+        approved,
+        duration,
+        install_ssh_key: install_key,
+    };
+    write_frame(&mut stream_send, &resp).await?;
+    if approved {
+        println!("Authorized successfully.");
+    } else {
+        println!("Connection request denied.");
+    }
     Ok(())
 }
 
@@ -570,21 +745,33 @@ async fn run_connect(
         };
         write_frame(&mut p_send, &pair_req).await?;
 
-        match read_frame(&mut p_recv).await? {
-            ControlMessage::PairResult { success: true, .. } => {
-                eprintln!("Pairing approved! Connecting to SSH target...");
+        // The relay sends the SAS first so both operators can compare it while
+        // the host is still deciding, then sends the final PairResult.
+        loop {
+            match read_frame(&mut p_recv).await? {
+                ControlMessage::PairPending { sas, .. } => {
+                    eprintln!("--------------------------------------------------");
+                    eprintln!("PAIRING REQUEST SENT");
+                    eprintln!("Authentication Code (SAS): [{sas}]");
+                    eprintln!("Confirm this matches the code shown on the host.");
+                    eprintln!("--------------------------------------------------");
+                }
+                ControlMessage::PairResult { success: true, .. } => {
+                    eprintln!("Pairing approved! Connecting to SSH target...");
+                    break;
+                }
+                ControlMessage::PairResult {
+                    success: false,
+                    error,
+                    ..
+                } => {
+                    bail!(
+                        "Pairing failed: {:?}",
+                        error.unwrap_or(ErrorCode::Unauthorized)
+                    );
+                }
+                other => bail!("unexpected relay response during pairing: {other:?}"),
             }
-            ControlMessage::PairResult {
-                success: false,
-                error,
-                ..
-            } => {
-                bail!(
-                    "Pairing failed: {:?}",
-                    error.unwrap_or(ErrorCode::Unauthorized)
-                );
-            }
-            _ => bail!("unexpected relay response during pairing"),
         }
     }
 
@@ -626,7 +813,7 @@ async fn fetch_agents(state_dir: &Path) -> Result<Vec<AgentDetail>> {
         config.relay_port,
         &id,
         verifier,
-        ALPN_TUNNEL,
+        ALPN_RENDEZVOUS,
     )
     .await?;
 
@@ -658,6 +845,127 @@ async fn fetch_agents(state_dir: &Path) -> Result<Vec<AgentDetail>> {
         }
         other => bail!("unexpected response from relay: {other:?}"),
     }
+}
+
+/// Prints every granted device, its online status, and its advertised targets.
+async fn list_agents(state_dir: &Path) -> Result<()> {
+    let agents = fetch_agents(state_dir).await?;
+
+    println!(
+        "{:<24} {:<8} {:<20} OTHER TARGETS",
+        "DEVICE ID", "STATUS", "DEFAULT TARGET"
+    );
+    for a in agents {
+        let status = if a.online { "online" } else { "offline" };
+        let default = a
+            .targets
+            .first()
+            .map_or_else(|| String::from("-"), Clone::clone);
+        let others = if a.targets.len() > 1 {
+            a.targets[1..].join(", ")
+        } else {
+            String::from("-")
+        };
+        println!(
+            "{:<24} {status:<8} {default:<20} {others}",
+            format_device_id(&a.name)
+        );
+    }
+    Ok(())
+}
+
+/// Looks up a device's advertised targets, warning instead of failing when the
+/// relay is unreachable or predates target discovery.
+async fn resolve_agent_targets(state_dir: &Path, agent: &str) -> Vec<String> {
+    match fetch_agents(state_dir).await {
+        Ok(agents) => agents
+            .into_iter()
+            .find(|a| a.name == agent)
+            .map_or_else(Vec::new, |a| a.targets),
+        Err(e) => {
+            eprintln!(
+                "warning: could not discover targets for '{agent}' ({e:#}); using the default target"
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Prints OpenSSH host entries for one device, discovering targets when omitted.
+async fn print_ssh_config(state_dir: &Path, agent: &str, target: Option<&str>) -> Result<()> {
+    if !is_valid_name(agent) {
+        bail!("device ID or agent name must match [a-z0-9-]{{1,63}}");
+    }
+
+    let hosts = if let Some(dest) = target {
+        HostPort::parse(dest)
+            .map_err(|_| anyhow!("invalid target host:port specification: {dest}"))?;
+        vec![SshHost {
+            alias: agent.to_string(),
+            agent: agent.to_string(),
+            target: Some(dest.to_string()),
+        }]
+    } else {
+        ssh_hosts(agent, &resolve_agent_targets(state_dir, agent).await)
+    };
+
+    print!("{}", render_snippets(&hosts));
+    Ok(())
+}
+
+/// Writes OpenSSH snippets for one device, or for every granted device with `--all`.
+async fn write_ssh_config(
+    state_dir: &Path,
+    agent: Option<&str>,
+    target: Option<&str>,
+    all: bool,
+) -> Result<()> {
+    if all && (agent.is_some() || target.is_some()) {
+        bail!("--all writes every granted device and cannot be combined with a device or target");
+    }
+
+    let planned: Vec<(String, Vec<SshHost>)> = if all {
+        fetch_agents(state_dir)
+            .await?
+            .into_iter()
+            .map(|a| (a.name.clone(), ssh_hosts(&a.name, &a.targets)))
+            .collect()
+    } else {
+        let agent = agent.context("a device ID or agent name is required (or use --all)")?;
+        if !is_valid_name(agent) {
+            bail!("device ID or agent name must match [a-z0-9-]{{1,63}}");
+        }
+
+        let hosts = if let Some(dest) = target {
+            HostPort::parse(dest)
+                .map_err(|_| anyhow!("invalid target host:port specification: {dest}"))?;
+            vec![SshHost {
+                alias: agent.to_string(),
+                agent: agent.to_string(),
+                target: Some(dest.to_string()),
+            }]
+        } else {
+            ssh_hosts(agent, &resolve_agent_targets(state_dir, agent).await)
+        };
+        vec![(agent.to_string(), hosts)]
+    };
+
+    let home = BaseDirs::new()
+        .map(|dirs| dirs.home_dir().to_path_buf())
+        .context("cannot determine home directory")?;
+    let snippets = rtunnel_install::configure_ssh_include(&home)
+        .context("failed to configure the OpenSSH include")?;
+
+    if planned.is_empty() {
+        println!("No granted devices found; nothing to write.");
+        return Ok(());
+    }
+
+    for (name, hosts) in planned {
+        let path = write_agent_snippet(&snippets, &name, &hosts)?;
+        println!("Wrote {}", path.display());
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -764,6 +1072,23 @@ async fn write_all_ssh_configs(state_dir: &Path) -> Result<Vec<String>> {
     Ok(written)
 }
 
+/// Installs `rtunnel host` as a platform background service.
+fn install_host_service(state_dir: &Path, target: &str) -> Result<()> {
+    let bin = std::env::current_exe()?;
+    let state_dir_arg = state_dir.to_string_lossy().into_owned();
+    let target = HostPort::parse(target)
+        .map_err(|_| anyhow!("invalid host target; expected host:port"))?
+        .to_string();
+    rtunnel_install::install_service(
+        "rtunnel",
+        &bin,
+        &["host", "--state-dir", &state_dir_arg, "--target", &target],
+        state_dir,
+    )?;
+    println!("rtunnel background service installed and started.");
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -787,6 +1112,7 @@ async fn main() -> Result<()> {
         Command::Id => {
             let (config, _) = load_client_state(&state_dir)?;
             println!("Device ID: {}", format_device_id(&config.client_name));
+            println!("State directory: {}", state_dir.display());
         }
         Command::Connect { target, code, dest } => {
             let code_exit = match run_connect(&state_dir, &target, code, dest).await {
@@ -798,22 +1124,22 @@ async fn main() -> Result<()> {
             };
             std::process::exit(code_exit);
         }
-        Command::Host => {
-            run_host(&state_dir).await?;
+        Command::Host { target } => {
+            run_host(&state_dir, &target).await?;
         }
         Command::Service { action } => match action {
-            ServiceCommand::Install { relay_host: _ } => {
-                let bin = std::env::current_exe()?;
-                rtunnel_install::install_service(
-                    "rtunnel",
-                    &bin,
-                    &["host", "--state-dir", &state_dir.to_string_lossy()],
-                    &state_dir,
-                )?;
-                println!("rtunnel background service installed and started.");
+            ServiceCommand::Install {
+                relay_host: _,
+                target,
+            } => install_host_service(&state_dir, &target)?,
+            ServiceCommand::Start => {
+                rtunnel_install::start_service("rtunnel")?;
+                println!("rtunnel service started.");
             }
-            ServiceCommand::Start => println!("Starting service..."),
-            ServiceCommand::Stop => println!("Stopping service..."),
+            ServiceCommand::Stop => {
+                rtunnel_install::stop_service("rtunnel")?;
+                println!("rtunnel service stopped.");
+            }
         },
         Command::Install {
             uri,
@@ -836,18 +1162,23 @@ async fn main() -> Result<()> {
             enroll(&state_dir, &uri).await?;
         }
         Command::Agents => {
-            println!("{:<15} {:<8}", "DEVICE ID", "STATUS");
-            let agents = fetch_agents(&state_dir).await?;
-            for a in agents {
-                println!(
-                    "{:<15} {:<8}",
-                    format_device_id(&a.name),
-                    if a.online { "online" } else { "offline" }
-                );
-            }
+            list_agents(&state_dir).await?;
         }
-        Command::SshConfig { .. } => {
-            println!("Writing SSH config...");
+        Command::SshConfig {
+            agent,
+            target,
+            write,
+            all,
+        } => {
+            if write {
+                write_ssh_config(&state_dir, agent.as_deref(), target.as_deref(), all).await?;
+            } else {
+                if all {
+                    bail!("--all is only meaningful together with --write");
+                }
+                let agent = agent.context("a device ID or agent name is required")?;
+                print_ssh_config(&state_dir, &agent, target.as_deref()).await?;
+            }
         }
     }
     Ok(())

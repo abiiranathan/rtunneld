@@ -24,8 +24,9 @@ pub const ALPN_RENDEZVOUS: &[u8] = b"rtunnel-rendezvous/1";
 
 /// Current protocol minor revision.
 ///
-/// Revision 3 adds AnyDesk-style Device IDs, SAS pairing, and dynamic approvals.
-pub const PROTOCOL_MINOR: u16 = 3;
+/// Revision 4 adds the early `PairPending` notice so both operators can compare
+/// the SAS before either side approves the pairing request.
+pub const PROTOCOL_MINOR: u16 = 4;
 
 /// Stable protocol error codes exchanged between relay, agent, and client peers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -352,6 +353,16 @@ pub enum ControlMessage {
         host_device_id: String,
         /// Error details if denied or failed.
         error: Option<ErrorCode>,
+    },
+    /// Relay announces a pending pairing request so the client can display the
+    /// same SAS the host operator is asked to approve.
+    PairPending {
+        /// Request session token shared with the host prompt.
+        pair_session_id: String,
+        /// 4-digit Short Authentication String both operators compare.
+        sas: String,
+        /// Canonical host Device ID being paired with.
+        host_device_id: String,
     },
 }
 

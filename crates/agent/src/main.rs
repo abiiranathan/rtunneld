@@ -12,6 +12,7 @@ use rtunnel_transport::{create_client_endpoint, make_client_config, read_frame, 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio::net::lookup_host;
 use tracing_subscriber::EnvFilter;
 
 /// Hardened systemd unit embedded at build time so `install` needs no checkout.
@@ -154,11 +155,23 @@ async fn enroll_agent(
     let id = generate_identity("agent")?;
     save_identity(state_dir, &id)?;
 
-    let relay_addr: SocketAddr = format!("{}:{}", parsed_uri.host, parsed_uri.port)
-        .parse()
-        .context("invalid relay address")?;
+    let relay_addr: SocketAddr = lookup_host((parsed_uri.host.as_str(), parsed_uri.port))
+        .await
+        .with_context(|| {
+            format!(
+                "cannot resolve relay address {}:{}",
+                parsed_uri.host, parsed_uri.port
+            )
+        })?
+        .find(SocketAddr::is_ipv4)
+        .with_context(|| {
+            format!(
+                "relay {}:{} has no IPv4 address",
+                parsed_uri.host, parsed_uri.port
+            )
+        })?;
 
-    let endpoint = create_client_endpoint("0.0.0.0:0".parse().unwrap())?;
+    let endpoint = create_client_endpoint(SocketAddr::from(([0, 0, 0, 0], 0)))?;
     let verifier = Arc::new(PinnedServerVerifier::new(&parsed_uri.relay_fingerprint));
     let client_config = make_client_config(
         &id.certificate_der,

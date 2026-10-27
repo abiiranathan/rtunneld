@@ -30,3 +30,4 @@ rtunnel-proto = { path = "../proto" }
 rtunnel-identity = { path = "../identity" }
 rtunnel-install = { path = "../install" }
 rtunnel-transport = { path = "../transport" }
+rtunnel-agent = { path = "../agent" }

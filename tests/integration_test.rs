@@ -5,7 +5,8 @@ use rtunnel_identity::{
     EnrollmentUri, KeyMaterial, PinnedServerVerifier, generate_identity, save_identity,
 };
 use rtunnel_proto::{
-    ALPN_ENROLL, ALPN_RENDEZVOUS, ALPN_TUNNEL, ControlMessage, ErrorCode, HostPort, ResultStatus,
+    ALPN_ENROLL, ALPN_RENDEZVOUS, ALPN_TUNNEL, ControlMessage, ErrorCode, GrantDuration, HostPort,
+    ResultStatus,
 };
 use rtunnel_relay::{AuditLogger, RelayServer, SqliteStore};
 use rtunnel_transport::{create_client_endpoint, make_client_config, read_frame, write_frame};
@@ -174,6 +175,32 @@ impl TestHarness {
 
         id
     }
+
+    /// Opens an authenticated connection offering exactly `alpns`.
+    ///
+    /// The endpoint is returned so the caller keeps the QUIC driver alive for
+    /// the lifetime of the connection.
+    async fn connect_as(
+        &self,
+        id: &KeyMaterial,
+        alpns: Vec<Vec<u8>>,
+    ) -> (quinn::Endpoint, quinn::Connection) {
+        let endpoint = create_client_endpoint("0.0.0.0:0".parse().unwrap()).unwrap();
+        let verifier = Arc::new(PinnedServerVerifier::new(&self.relay_identity.fingerprint));
+        let client_config =
+            make_client_config(&id.certificate_der, &id.private_key_pem, verifier, alpns).unwrap();
+
+        let conn = endpoint
+            .connect_with(
+                client_config,
+                self.relay_addr,
+                &self.relay_addr.ip().to_string(),
+            )
+            .unwrap()
+            .await
+            .unwrap();
+        (endpoint, conn)
+    }
 }
 
 async fn start_echo_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
@@ -189,6 +216,129 @@ async fn start_echo_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
         }
     });
     (addr, handle)
+}
+
+/// Registers a host identity on a rendezvous connection and publishes its
+/// pairing code, mirroring what `rtunnel host` does at startup.
+async fn start_pairing_host(
+    harness: &TestHarness,
+    host_id: &KeyMaterial,
+    host_device_id: &str,
+    code_hash: &str,
+) -> (quinn::Endpoint, quinn::Connection) {
+    let (endpoint, connection) = harness
+        .connect_as(host_id, vec![ALPN_RENDEZVOUS.to_vec()])
+        .await;
+
+    let (mut reg_send, mut reg_recv) = connection.open_bi().await.unwrap();
+    write_frame(
+        &mut reg_send,
+        &ControlMessage::RegisterDevice {
+            label: "host-pc".into(),
+            existing_device_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    match read_frame(&mut reg_recv).await.unwrap() {
+        ControlMessage::RegisterDeviceAck { device_id } => {
+            assert_eq!(device_id, host_device_id);
+        }
+        other => panic!("expected RegisterDeviceAck, got {other:?}"),
+    }
+
+    let (mut code_send, _code_recv) = connection.open_bi().await.unwrap();
+    write_frame(
+        &mut code_send,
+        &ControlMessage::SetPairingCode {
+            code_hash: code_hash.to_owned(),
+            ttl_secs: 300,
+        },
+    )
+    .await
+    .unwrap();
+
+    (endpoint, connection)
+}
+
+/// Runs the client pairing exchange and answers the host prompt with
+/// `Allow Once`. Returns the client connection ready for a tunnel request.
+async fn pair_client_with_allow_once(
+    harness: &TestHarness,
+    client_id: &KeyMaterial,
+    host_connection: &quinn::Connection,
+    host_device_id: &str,
+    code: &str,
+) -> (quinn::Endpoint, quinn::Connection) {
+    let (endpoint, connection) = harness
+        .connect_as(client_id, vec![ALPN_RENDEZVOUS.to_vec()])
+        .await;
+
+    let (mut pair_send, mut pair_recv) = connection.open_bi().await.unwrap();
+    write_frame(
+        &mut pair_send,
+        &ControlMessage::PairRequest {
+            target_device_id: host_device_id.to_owned(),
+            code: code.to_owned(),
+            client_label: "test-client".into(),
+            ssh_pubkey: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let pending_sas = match read_frame(&mut pair_recv).await.unwrap() {
+        ControlMessage::PairPending {
+            sas,
+            host_device_id: id,
+            ..
+        } => {
+            assert_eq!(id, host_device_id);
+            sas
+        }
+        other => panic!("expected PairPending, got {other:?}"),
+    };
+
+    let (mut prompt_send, mut prompt_recv) =
+        tokio::time::timeout(Duration::from_secs(5), host_connection.accept_bi())
+            .await
+            .expect("timed out waiting for the host pairing prompt")
+            .unwrap();
+    let (prompt_sas, pair_session_id) = match read_frame(&mut prompt_recv).await.unwrap() {
+        ControlMessage::IncomingPairPrompt {
+            sas,
+            pair_session_id,
+            ..
+        } => (sas, pair_session_id),
+        other => panic!("expected IncomingPairPrompt, got {other:?}"),
+    };
+    assert_eq!(
+        prompt_sas, pending_sas,
+        "client and host must display the same SAS"
+    );
+
+    write_frame(
+        &mut prompt_send,
+        &ControlMessage::PairPromptResponse {
+            pair_session_id,
+            approved: true,
+            duration: GrantDuration::Once,
+            install_ssh_key: false,
+        },
+    )
+    .await
+    .unwrap();
+
+    match read_frame(&mut pair_recv).await.unwrap() {
+        ControlMessage::PairResult {
+            success: true,
+            host_device_id: id,
+            ..
+        } => assert_eq!(id, host_device_id),
+        other => panic!("expected successful PairResult, got {other:?}"),
+    }
+
+    (endpoint, connection)
 }
 
 #[tokio::test]
@@ -759,6 +909,172 @@ async fn test_rendezvous_register_device_over_quic() {
         }
         other => panic!("expected RegisterDeviceAck, got {other:?}"),
     }
+}
+
+/// Verifies that the relay prefers rendezvous when a peer offers both ALPNs.
+#[tokio::test]
+async fn test_relay_negotiates_rendezvous_when_peer_offers_both_alpns() {
+    let harness = TestHarness::start();
+    let peer_id = generate_identity("dual-alpn-peer").unwrap();
+
+    // Offer tunnel first, then rendezvous. The relay must apply its own
+    // preference (rendezvous) rather than the client's ordering. If tunnel is
+    // selected, this unregistered identity is rejected before RegisterDevice.
+    let (_endpoint, conn) = harness
+        .connect_as(
+            &peer_id,
+            vec![ALPN_TUNNEL.to_vec(), ALPN_RENDEZVOUS.to_vec()],
+        )
+        .await;
+
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    write_frame(
+        &mut send,
+        &ControlMessage::RegisterDevice {
+            label: "dual-alpn".into(),
+            existing_device_id: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    match read_frame(&mut recv).await.unwrap() {
+        ControlMessage::RegisterDeviceAck { device_id } => {
+            assert_eq!(device_id.len(), 9);
+        }
+        other => panic!("expected rendezvous registration, got {other:?}"),
+    }
+}
+
+/// Verifies that `rtunnel setup` registers a Device ID over rendezvous and
+/// persists the relay fingerprint and assigned ID.
+#[tokio::test]
+async fn test_cli_setup_registers_device_id_over_rendezvous() {
+    let harness = TestHarness::start();
+    let temp = tempfile::tempdir().unwrap();
+    let state_dir = temp.path().join("client-state");
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let output = tokio::process::Command::new(rtunnel_binary_path())
+        .arg("setup")
+        .arg("--state-dir")
+        .arg(&state_dir)
+        .arg("--relay-host")
+        .arg(harness.relay_addr.ip().to_string())
+        .arg("--relay-port")
+        .arg(harness.relay_addr.port().to_string())
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .output()
+        .await
+        .expect("failed to execute rtunnel setup");
+
+    assert!(
+        output.status.success(),
+        "rtunnel setup failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let config = rtunnel_client::ClientConfig::load(&state_dir).unwrap();
+    assert_eq!(config.relay_host, harness.relay_addr.ip().to_string());
+    assert_eq!(config.relay_port, harness.relay_addr.port());
+    assert_eq!(config.relay_fingerprint, harness.relay_identity.fingerprint);
+    assert_eq!(config.client_name.len(), 9);
+    assert!(config.client_name.chars().all(|c| c.is_ascii_digit()));
+
+    let peer = harness
+        .store
+        .get_peer_by_name(&config.client_name)
+        .unwrap()
+        .expect("setup must register the peer in the relay store");
+    assert_eq!(peer.role, "node");
+}
+
+/// End-to-end regression: pairing prompts travel over the host's rendezvous
+/// connection, "Allow Once" authorizes the following tunnel connect, and the
+/// SAS shown to both operators is identical.
+#[tokio::test]
+async fn test_rendezvous_pairing_allow_once_then_tunnel_connect() {
+    let harness = TestHarness::start();
+    let (echo_addr, _echo_handle) = start_echo_server().await;
+
+    let host_id = generate_identity("pairing-host").unwrap();
+    let host_device_id = harness
+        .store
+        .get_or_allocate_device_id(&host_id.fingerprint, "host-pc")
+        .unwrap();
+    let client_id = generate_identity("pairing-client").unwrap();
+    let _client_device_id = harness
+        .store
+        .get_or_allocate_device_id(&client_id.fingerprint, "client-pc")
+        .unwrap();
+
+    let code = "834291";
+    let code_hash = rtunnel_identity::hex_encode(&Sha256::digest(code.as_bytes()));
+    harness
+        .store
+        .set_pairing_code(&host_device_id, &code_hash, 300)
+        .unwrap();
+
+    // The tunnel connection serves target sessions and advertises the allowlist.
+    let agent_cfg = AgentConfig {
+        relay_host: harness.relay_addr.ip().to_string(),
+        relay_port: harness.relay_addr.port(),
+        relay_fingerprint: harness.relay_identity.fingerprint.clone(),
+        agent_name: host_device_id.clone(),
+        allowed_targets: vec![echo_addr.to_string()],
+        max_sessions: 8,
+    };
+    tokio::spawn(AgentRunner::new(agent_cfg, host_id.clone()).run());
+
+    // The host's rendezvous connection registers the Device ID and publishes
+    // the pairing code. Pairing prompts must arrive here, not on the tunnel.
+    let (_host_endpoint, host_conn) =
+        start_pairing_host(&harness, &host_id, &host_device_id, &code_hash).await;
+
+    // Client requests pairing and receives the SAS before the host decides.
+    let (_client_endpoint, client_conn) =
+        pair_client_with_allow_once(&harness, &client_id, &host_conn, &host_device_id, code).await;
+
+    // The tunnel may still be connecting; retry until the agent is online.
+    let target = HostPort::new(echo_addr.ip().to_string(), echo_addr.port()).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut session = None;
+    while tokio::time::Instant::now() < deadline {
+        let (mut send, mut recv) = client_conn.open_bi().await.unwrap();
+        write_frame(
+            &mut send,
+            &ControlMessage::ConnectRequest {
+                agent: host_device_id.clone(),
+                target: Some(target.clone()),
+            },
+        )
+        .await
+        .unwrap();
+
+        match read_frame(&mut recv).await.unwrap() {
+            ControlMessage::ConnectResponse {
+                status: ResultStatus::Ok,
+                ..
+            } => {
+                session = Some((send, recv));
+                break;
+            }
+            ControlMessage::ConnectResponse {
+                status: ResultStatus::Err(ErrorCode::AgentOffline),
+                ..
+            } => tokio::time::sleep(Duration::from_millis(100)).await,
+            other => panic!("unexpected connect response: {other:?}"),
+        }
+    }
+    let (mut send, mut recv) = session.expect("host tunnel did not come online in time");
+
+    send.write_all(b"paired").await.unwrap();
+    let mut echoed = [0u8; 6];
+    recv.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(&echoed, b"paired");
 }
 
 /// Verifies that 5 incorrect pairing attempts trigger progressive lockout.

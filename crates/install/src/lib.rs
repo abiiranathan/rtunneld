@@ -309,7 +309,7 @@ WantedBy=multi-user.target
 </dict>
 </plist>
 "#,
-            state_dir.display()
+            _state_dir.display()
         );
 
         fs::write(&plist_path, plist_content)?;
@@ -351,7 +351,105 @@ WantedBy=multi-user.target
 
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
-        let _ = (service_name, bin_path, args, state_dir);
+        let _ = (service_name, bin_path, args, _state_dir);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "platform service manager not supported",
+        ))
+    }
+}
+
+/// Starts an installed background service for `service_name`.
+///
+/// # Errors
+///
+/// Returns an error when the platform service manager is unavailable or rejects
+/// the start request.
+pub fn start_service(service_name: &str) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        systemctl(&["start", &format!("{service_name}.service")])
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("launchctl")
+            .args(["start", &format!("com.rtunnel.{service_name}")])
+            .output()?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "launchctl start failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )))
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let status = Command::new("sc.exe")
+            .args(["start", service_name])
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other("sc.exe start service failed"))
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        let _ = service_name;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "platform service manager not supported",
+        ))
+    }
+}
+
+/// Stops an installed background service for `service_name`.
+///
+/// # Errors
+///
+/// Returns an error when the platform service manager is unavailable or rejects
+/// the stop request.
+pub fn stop_service(service_name: &str) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        systemctl(&["stop", &format!("{service_name}.service")])
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("launchctl")
+            .args(["stop", &format!("com.rtunnel.{service_name}")])
+            .output()?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "launchctl stop failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )))
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let status = Command::new("sc.exe")
+            .args(["stop", service_name])
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other("sc.exe stop service failed"))
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        let _ = service_name;
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "platform service manager not supported",

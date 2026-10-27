@@ -1230,6 +1230,7 @@ dependencies = [
  "directories",
  "quinn",
  "rand 0.8.8",
+ "rtunnel-agent",
  "rtunnel-identity",
  "rtunnel-install",
  "rtunnel-proto",
