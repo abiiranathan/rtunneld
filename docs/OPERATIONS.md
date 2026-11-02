@@ -33,6 +33,29 @@ first `allowed_targets` entry); extra targets get short aliases such as
 rtunnel ssh-config --all --write
 ```
 
+Devices also carry a relay-side canonical name. Set one during setup with
+`rtunnel setup --name office-pc`, or change it later:
+
+```bash
+rtunnel name                 # show this device's Device ID and canonical name
+rtunnel name office-pc       # update the relay and local config
+sudo rtunneld name 482913077 office-pc   # operator-side rename on the relay
+```
+
+Names match `[a-z0-9-]{1,63}` and are unique case-insensitively. They are
+resolved to the stable Device ID before grants are checked, so a rename never
+changes authorization. A host that has a local `display_name` republishes it
+when it reconnects, replacing an operator-only rename. Inspect names with:
+
+```bash
+rtunnel agents
+sudo rtunneld peers-list
+```
+
+`rtunnel tui` provides the same device list interactively and launches the local
+`ssh` binary with `ProxyCommand=rtunnel connect <device-id>`. Pass `--user` when
+the remote username differs from the local one.
+
 Change an agent's allowlist without re-enrolling it:
 
 ```bash
@@ -88,11 +111,13 @@ ssh user@<agent>
 - Client State (Windows): `%APPDATA%\rtunnel` (`identity.key`, `identity.crt`, `config.toml`)
 - Client SSH snippets: `~/.ssh/rtunnel.d/*.conf`, loaded from `~/.ssh/config` by `rtunnel install`, `rtunnel ssh-config --write`, or `rtunnel ssh-config --all --write`; on Windows the same files live under `%USERPROFILE%\.ssh\rtunnel.d\`
 - Relay agent targets: `agent_targets` table in `rtunnel.db` stores the last targets advertised by each agent, so `rtunnel agents` can describe an agent while it is offline.
+- Relay canonical names: the `peers.display_name` column in `rtunnel.db` stores each device's relay-side name. It is nullable, unique case-insensitively, and preserved across restarts and in-place upgrades.
 
 ## Audit Logging
 The relay produces an append-only JSONL log at `<state_dir>/audit.log` recording:
 - `session_open`, `session_close` (byte counts and duration)
 - `auth_failure`
 - `enroll`
+- `name_change`
 - `grant_change`
 - `revoke`

@@ -6,8 +6,10 @@ Both machines dial out to a small relay over QUIC, and SSH stays end-to-end
 between your OpenSSH client and the host's `sshd`.
 
 - Connect with a 9-digit Device ID and a one-time access code.
+- Give each device a memorable canonical name that the relay reports everywhere.
 - Confirm the connection with a matching 4-digit code on both machines.
 - Persist an approved client so later connections need no code.
+- Browse devices and open SSH from the built-in `rtunnel tui`.
 - Run the host as a service so it reconnects after a reboot.
 
 ## How it works
@@ -171,8 +173,20 @@ If the relay uses a non-default port, add `--relay-port <port>`. Setup pins the
 relay certificate with Trust On First Use and prints the fingerprint; pass
 `--relay-fingerprint <sha256>` if you want to pin it explicitly instead.
 
-Setup prints a permanent 9-digit Device ID. Note the host's Device ID; you need
-it from the workstation.
+Give each machine a canonical name so the relay and other devices can refer to
+it by name instead of only by its Device ID:
+
+```bash
+rtunnel setup --relay-host relay.example.com --name office-pc
+```
+
+Names use lowercase letters, digits, and hyphens (`[a-z0-9-]{1,63}`) and are
+unique across the relay, case-insensitively. If `--name` is omitted, the relay
+derives a slug from the machine's registration label. You can change the name
+later with `rtunnel name`.
+
+Setup prints a permanent 9-digit Device ID. Note the host's Device ID; you can
+use either the Device ID or its canonical name from the workstation.
 
 ---
 
@@ -224,12 +238,13 @@ Both SAS values must match. Approval choices:
 After choosing **Always Allow**, write a permanent OpenSSH host entry:
 
 ```bash
-rtunnel ssh-config 482913077 --write
-ssh <user>@482913077
+rtunnel ssh-config office-pc --write
+ssh <user>@office-pc
 ```
 
 `rtunnel ssh-config --all --write` refreshes entries for every device granted to
-this workstation.
+this workstation. Generated aliases use canonical names, while the underlying
+`ProxyCommand` still uses the stable Device ID.
 
 ---
 
@@ -282,10 +297,49 @@ On macOS the default state directory is
 
 ```bash
 rtunnel id                      # local Device ID and state directory
+rtunnel name                    # show this device's canonical name
+rtunnel name office-pc          # rename this device on the relay
 rtunnel agents                  # reachable devices and their targets
+rtunnel tui                     # browse devices and open SSH interactively
 rtunnel ssh-config --all --write
-ssh <user>@482913077
+ssh <user>@office-pc
 ```
+
+`rtunnel agents` lists the canonical name and the stable Device ID separately:
+
+```text
+NAME                 DEVICE ID       STATUS   DEFAULT TARGET       OTHER TARGETS
+office-pc            482 913 077     online   127.0.0.1:22         -
+nas                  734 220 118     offline  127.0.0.1:22         192.168.1.10:445
+```
+
+`rtunnel name` updates the relay immediately and saves the name in the local
+config, so a running host re-asserts it on its next rendezvous reconnect. An
+administrator rename with `rtunneld name` is therefore superseded if that device
+has a locally configured `display_name`.
+
+### Interactive device picker
+
+`rtunnel tui` shows every granted device, whether it is online, and its targets.
+Select a row and press Enter to launch your local OpenSSH client. The TUI passes
+this binary as `ProxyCommand`, so SSH keys and host verification behave exactly
+as they do with a generated `ssh-config` entry.
+
+```bash
+rtunnel tui                     # SSH as your local username
+rtunnel tui --user root         # override the remote user
+```
+
+| Key | Action |
+| --- | --- |
+| Up / Down, `k` / `j` | Move between devices |
+| Left / Right, `h` / `l` | Cycle the target for the selected device |
+| Enter | Open SSH to the selection |
+| `r` | Refresh the device list immediately |
+| `q`, Esc | Quit |
+
+The list refreshes from the relay every 5 seconds. You need `ssh` on `PATH`; set
+`--user` when your local username differs from the remote one.
 
 ---
 
@@ -328,10 +382,20 @@ Run these on the relay host:
 
 ```bash
 sudo rtunneld peers-list
+sudo rtunneld name <device-id-or-name> <canonical-name>
 sudo rtunneld grant list
 sudo rtunneld grant add <client> <host>
 sudo rtunneld grant remove <client> <host>
 sudo rtunneld revoke <peer>
+```
+
+`peers-list` shows each peer's Device ID, canonical name, role, and revocation
+state. `rtunneld name` sets or replaces a canonical name and records the change
+in the audit log. It accepts a Device ID, enrollment name, or existing canonical
+name as the first argument:
+
+```bash
+sudo rtunneld name 482913077 office-pc
 ```
 
 Revoking a peer terminates its active sessions within 5 seconds and rejects
@@ -426,6 +490,14 @@ Check the username, the key in `~/.ssh/authorized_keys`, its permissions, and
 
 **`InvalidPairingCode`** — the code was already consumed or has expired. Use the
 latest `Access Code:` line printed by the host.
+
+**`InvalidName` / `NameTaken`** — canonical names must match `[a-z0-9-]{1,63}`
+and must be unique across the relay. Choose another name or check the current
+owners with `rtunnel agents` and `sudo rtunneld peers-list`.
+
+**`rtunnel tui` cannot start SSH** — the picker launches the local `ssh` binary.
+Confirm OpenSSH is installed and on `PATH`, and pass `rtunnel tui --user <user>`
+if your local and remote usernames differ.
 
 **Relay handshake fails** — verify the relay address, that UDP `4433` is open,
 and that `rtunnel setup --relay-fingerprint` matches the relay's certificate.

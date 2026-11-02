@@ -806,7 +806,8 @@ fn render_live_agents(agents: &[LiveAgent]) -> String {
 
     let mut rows = String::new();
     for agent in agents {
-        let name = esc(&format_device_id(&agent.name));
+        let label = esc(agent.display_name.as_deref().unwrap_or(&agent.name));
+        let device = esc(&format_device_id(&agent.name));
         let fingerprint = esc(&agent.fingerprint);
         let short = esc(&fingerprint_short(&agent.fingerprint));
         let address = esc(&agent.remote_addr.to_string());
@@ -815,7 +816,7 @@ fn render_live_agents(agents: &[LiveAgent]) -> String {
         let _ = write!(
             rows,
             r#"<tr>
-<td><div class="agent-name">{name}</div><div class="fp mono" title="{fingerprint}">{short}</div></td>
+<td><div class="agent-name">{label}</div><div class="fp mono">{device}</div><div class="fp mono" title="{fingerprint}">{short}</div></td>
 <td>{targets}</td>
 <td class="mono">{address}</td>
 <td>{connected}</td>
@@ -877,7 +878,8 @@ fn render_peers(peers: &[PeerRecord], online: &HashSet<String>, csrf: &str) -> S
 
     let mut rows = String::new();
     for peer in peers {
-        let name = esc(&format_device_id(&peer.name));
+        let label = esc(peer.display_name.as_deref().unwrap_or(&peer.name));
+        let device = esc(&format_device_id(&peer.name));
         let fingerprint = esc(&peer.fingerprint);
         let short = esc(&fingerprint_short(&peer.fingerprint));
         let status = if peer.revoked {
@@ -898,7 +900,7 @@ fn render_peers(peers: &[PeerRecord], online: &HashSet<String>, csrf: &str) -> S
         };
         let _ = write!(
             rows,
-            r#"<tr><td><div class="agent-name">{name}</div><div class="fp mono" title="{fingerprint}">{short}</div></td><td>{}</td><td>{status}</td><td>{action}</td></tr>"#,
+            r#"<tr><td><div class="agent-name">{label}</div><div class="fp mono">{device}</div><div class="fp mono" title="{fingerprint}">{short}</div></td><td>{}</td><td>{status}</td><td>{action}</td></tr>"#,
             role_badge(&peer.role)
         );
     }

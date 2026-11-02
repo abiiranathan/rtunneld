@@ -25,8 +25,9 @@ pub const ALPN_RENDEZVOUS: &[u8] = b"rtunnel-rendezvous/1";
 /// Current protocol minor revision.
 ///
 /// Revision 4 adds the early `PairPending` notice so both operators can compare
-/// the SAS before either side approves the pairing request.
-pub const PROTOCOL_MINOR: u16 = 4;
+/// the SAS before either side approves the pairing request. Revision 5 adds
+/// canonical peer display names and a named agent listing.
+pub const PROTOCOL_MINOR: u16 = 5;
 
 /// Stable protocol error codes exchanged between relay, agent, and client peers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,6 +58,10 @@ pub enum ErrorCode {
     PairingDenied = 12,
     /// The requested Device ID was not found on the rendezvous relay.
     DeviceNotFound = 13,
+    /// The requested canonical name is already used by another peer.
+    NameTaken = 14,
+    /// The requested canonical name does not match `[a-z0-9-]{1,63}`.
+    InvalidName = 15,
 }
 
 impl fmt::Display for ErrorCode {
@@ -75,6 +80,8 @@ impl fmt::Display for ErrorCode {
             Self::InvalidPairingCode => "InvalidPairingCode",
             Self::PairingDenied => "PairingDenied",
             Self::DeviceNotFound => "DeviceNotFound",
+            Self::NameTaken => "NameTaken",
+            Self::InvalidName => "InvalidName",
         };
         write!(f, "{name}")
     }
@@ -168,6 +175,27 @@ pub struct AgentDetail {
     pub online: bool,
     /// Exact-match `host:port` targets the agent accepts.
     pub targets: Vec<String>,
+}
+
+/// Agent status including its relay-side canonical name.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamedAgent {
+    /// The stable Device ID or enrollment name of the agent.
+    pub name: String,
+    /// Operator-assigned canonical name, when one has been set.
+    pub display_name: Option<String>,
+    /// Whether the agent currently holds an active connection to the relay.
+    pub online: bool,
+    /// Exact-match `host:port` targets the agent accepts.
+    pub targets: Vec<String>,
+}
+
+impl NamedAgent {
+    /// Returns the canonical name when set, otherwise the stable Device ID.
+    #[must_use]
+    pub fn label(&self) -> &str {
+        self.display_name.as_deref().unwrap_or(&self.name)
+    }
 }
 
 /// Level of persistence granted during host pairing approval.
@@ -364,6 +392,28 @@ pub enum ControlMessage {
         /// Canonical host Device ID being paired with.
         host_device_id: String,
     },
+
+    // --- Canonical Peer Names (Protocol Minor 5) ---
+    /// Assigns or replaces the authenticated peer's canonical display name.
+    SetDisplayName {
+        /// New canonical name matching `[a-z0-9-]{1,63}`.
+        name: String,
+    },
+    /// Confirms that the relay stored the canonical display name.
+    SetDisplayNameAck {
+        /// Canonical name now reported by the relay.
+        name: String,
+    },
+    /// Client query for agents including their canonical display names.
+    ListAgentsNamed {
+        /// Authenticated client name.
+        client_name: String,
+    },
+    /// Relay response carrying granted agents with canonical display names.
+    AgentsNamedResponse {
+        /// Granted agent statuses with display names and advertised targets.
+        agents: Vec<NamedAgent>,
+    },
 }
 
 /// Errors occurring during control frame serialization or decoding.
@@ -474,6 +524,22 @@ mod tests {
         assert_eq!(formatted, "482 913 077");
         assert_eq!(normalize_device_id(&formatted), "482913077");
         assert_eq!(normalize_device_id(" 482-913-077 "), "482913077");
+    }
+
+    #[test]
+    fn test_named_agent_label_prefers_display_name() {
+        let named = NamedAgent {
+            name: "482913077".into(),
+            display_name: Some("workshop-pc".into()),
+            online: true,
+            targets: Vec::new(),
+        };
+        assert_eq!(named.label(), "workshop-pc");
+        let unnamed = NamedAgent {
+            display_name: None,
+            ..named
+        };
+        assert_eq!(unnamed.label(), "482913077");
     }
 
     #[test]

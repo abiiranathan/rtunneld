@@ -14,10 +14,10 @@ use crate::audit::{AuditLogger, SessionOutcome, SessionRef};
 use crate::store::{PeerRecord, SqliteStore};
 
 use quinn::{Connection, Endpoint, Incoming, RecvStream, SendStream, VarInt};
-use rtunnel_identity::{KeyMaterial, PinnedClientVerifier, hex_encode};
+use rtunnel_identity::{KeyMaterial, PinnedClientVerifier, hex_encode, is_valid_name};
 use rtunnel_proto::{
     ALPN_ENROLL, ALPN_RENDEZVOUS, ALPN_TUNNEL, AgentDetail, AgentInfo, ControlMessage, ErrorCode,
-    GrantDuration, HostPort, ResultStatus, compute_sas, normalize_device_id,
+    GrantDuration, HostPort, NamedAgent, ResultStatus, compute_sas, normalize_device_id,
 };
 use rtunnel_transport::{
     RateLimiter, create_server_endpoint, extract_alpn, extract_peer_fingerprint,
@@ -73,6 +73,8 @@ struct AgentSession {
 pub struct LiveAgent {
     /// Agent or Device ID name.
     pub name: String,
+    /// Operator-assigned canonical name, when one has been set.
+    pub display_name: Option<String>,
     /// Pinned certificate fingerprint of the agent.
     pub fingerprint: String,
     /// Targets advertised by this live connection.
@@ -263,12 +265,25 @@ impl RelayServer {
             .iter()
             .map(|(name, session)| LiveAgent {
                 name: name.clone(),
+                display_name: None,
                 fingerprint: session.fingerprint.clone(),
                 targets: session.targets.clone(),
                 remote_addr: session.connection.remote_address(),
                 connected_secs: session.connected_at.elapsed().as_secs(),
             })
             .collect();
+        drop(agents);
+
+        // Canonical names live in the peer store, which is separate from the
+        // live connection registry. Resolve them after releasing the lock.
+        for agent in &mut live {
+            agent.display_name = self
+                .store
+                .get_peer_by_name(&agent.name)
+                .ok()
+                .flatten()
+                .and_then(|peer| peer.display_name);
+        }
         live.sort_by(|a, b| a.name.cmp(&b.name));
         live
     }
@@ -413,6 +428,7 @@ impl RelayServer {
 
         let new_peer = PeerRecord {
             name: record.name.clone(),
+            display_name: None,
             role: record.role.clone(),
             fingerprint: peer_fp.clone(),
             revoked: false,
@@ -502,6 +518,10 @@ impl RelayServer {
     ///
     /// Returns the Device ID when the frame registered a host, so the caller can
     /// publish the connection in the pairing-host registry.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one exhaustive match keeps every rendezvous frame in one place"
+    )]
     async fn handle_rendezvous_message(
         &self,
         message: ControlMessage,
@@ -591,6 +611,22 @@ impl RelayServer {
                     .await;
                 None
             }
+            ControlMessage::ListAgentsNamed { .. } => {
+                let client_id = match self.registered_peer_name(peer_fp) {
+                    Ok(name) => name,
+                    Err(code) => {
+                        send_error(&mut send, code, "device not registered").await;
+                        return None;
+                    }
+                };
+                self.handle_list_agents_named(&mut send, &client_id).await;
+                None
+            }
+            ControlMessage::SetDisplayName { name } => {
+                self.handle_set_display_name(&mut send, peer_fp, &name)
+                    .await;
+                None
+            }
             other => {
                 send_error(
                     &mut send,
@@ -632,6 +668,89 @@ impl RelayServer {
         }
     }
 
+    /// Stores a canonical display name for the authenticated peer and replies
+    /// with `SetDisplayNameAck`.
+    async fn handle_set_display_name(&self, send: &mut SendStream, peer_fp: &str, name: &str) {
+        let result = self.set_display_name_for(peer_fp, name);
+        match result {
+            Ok(stored) => {
+                let resp = ControlMessage::SetDisplayNameAck {
+                    name: stored.clone(),
+                };
+                if write_logged(send, &resp, "SetDisplayNameAck").await {
+                    finish_logged(send, "SetDisplayNameAck");
+                }
+            }
+            Err(code) => {
+                let message = match code {
+                    ErrorCode::InvalidName => "name must match [a-z0-9-]{1,63}",
+                    ErrorCode::NameTaken => "name is already used by another peer",
+                    ErrorCode::Unauthorized => "device not registered",
+                    _ => "cannot store name",
+                };
+                send_error(send, code, message).await;
+            }
+        }
+    }
+
+    /// Validates and persists a canonical name for the peer with `peer_fp`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::Unauthorized`] for an unknown fingerprint,
+    /// [`ErrorCode::InvalidName`] for a malformed name,
+    /// [`ErrorCode::NameTaken`] when the name shadows another peer, and
+    /// [`ErrorCode::Internal`] if the store fails.
+    fn set_display_name_for(&self, peer_fp: &str, name: &str) -> Result<String, ErrorCode> {
+        if !is_valid_name(name) {
+            return Err(ErrorCode::InvalidName);
+        }
+
+        let peer = self
+            .store
+            .get_peer_by_fingerprint(peer_fp)
+            .map_err(|error| {
+                warn!(error = %error, "peer lookup by fingerprint failed");
+                ErrorCode::Internal
+            })?
+            .ok_or(ErrorCode::Unauthorized)?;
+
+        let conflict = self
+            .store
+            .display_name_conflict(&peer.name, name)
+            .map_err(|error| {
+                warn!(device = %peer.name, error = %error, "display name conflict check failed");
+                ErrorCode::Internal
+            })?;
+        if conflict {
+            return Err(ErrorCode::NameTaken);
+        }
+
+        self.store
+            .set_display_name(&peer.name, Some(name))
+            .map_err(|error| {
+                warn!(device = %peer.name, error = %error, "cannot store display name");
+                ErrorCode::Internal
+            })?;
+        self.audit.log_name_change(&peer.name, name);
+        info!(device = %peer.name, name = %name, "canonical name updated");
+        Ok(name.to_owned())
+    }
+
+    /// Resolves a Device ID or canonical name to the peer's stable Device ID.
+    ///
+    /// Unknown references are returned unchanged so existing authorization
+    /// behavior (and its audit trail) is preserved.
+    fn resolve_agent_reference(&self, reference: &str) -> String {
+        if let Ok(Some(peer)) = self.store.get_peer_by_name(reference) {
+            return peer.name;
+        }
+        if let Ok(Some(peer)) = self.store.get_peer_by_display_name(reference) {
+            return peer.name;
+        }
+        reference.to_owned()
+    }
+
     /// Returns the registered name of the peer with the given fingerprint.
     ///
     /// # Errors
@@ -658,7 +777,15 @@ impl RelayServer {
         client_send: &mut SendStream,
         attempt: &PairingAttempt<'_>,
     ) {
-        let target_device_id = normalize_device_id(attempt.raw_target_id);
+        let raw = attempt.raw_target_id.trim();
+        let resolved = self.resolve_agent_reference(raw);
+        // A canonical name may contain hyphens, so only strip Device ID
+        // formatting when the reference did not resolve to a real peer.
+        let target_device_id = if resolved == raw {
+            normalize_device_id(raw)
+        } else {
+            resolved
+        };
         let error = self
             .run_pairing(client_send, attempt, &target_device_id)
             .await
@@ -1129,6 +1256,10 @@ impl RelayServer {
                 self.handle_list_agents_detailed(&mut client_send, client_name)
                     .await;
             }
+            ControlMessage::ListAgentsNamed { .. } => {
+                self.handle_list_agents_named(&mut client_send, client_name)
+                    .await;
+            }
             ControlMessage::ConnectRequest { agent, target } => {
                 self.process_connect_request(
                     client_send,
@@ -1279,6 +1410,62 @@ impl RelayServer {
         write_logged(client_send, &resp, "AgentsDetailedResponse").await;
     }
 
+    /// Replies to `ListAgentsNamed` with granted agents, canonical names,
+    /// online status, and targets.
+    async fn handle_list_agents_named(&self, client_send: &mut SendStream, client_name: &str) {
+        let granted = match self.granted_agents(client_name) {
+            Ok(granted) => granted,
+            Err(code) => {
+                send_error(client_send, code, "grant lookup failed").await;
+                return;
+            }
+        };
+
+        let mut live: HashMap<String, (bool, Vec<String>)> = {
+            let lock = self.agents.read().await;
+            granted
+                .iter()
+                .map(|agent| {
+                    let session = lock.get(agent);
+                    (
+                        agent.clone(),
+                        (
+                            session.is_some(),
+                            session.map_or_else(Vec::new, |s| s.targets.clone()),
+                        ),
+                    )
+                })
+                .collect()
+        };
+
+        let agents: Vec<NamedAgent> = granted
+            .into_iter()
+            .map(|name| {
+                let (online, advertised) = live.remove(&name).unwrap_or_default();
+                let targets = if advertised.is_empty() {
+                    self.persisted_targets(&name)
+                } else {
+                    advertised
+                };
+                let display_name = self
+                    .store
+                    .get_peer_by_name(&name)
+                    .ok()
+                    .flatten()
+                    .and_then(|peer| peer.display_name);
+                NamedAgent {
+                    name,
+                    display_name,
+                    online,
+                    targets,
+                }
+            })
+            .collect();
+
+        let resp = ControlMessage::AgentsNamedResponse { agents };
+        write_logged(client_send, &resp, "AgentsNamedResponse").await;
+    }
+
     /// Checks that `client_name` may connect to `agent_name`.
     ///
     /// # Errors
@@ -1312,6 +1499,10 @@ impl RelayServer {
         agent_name: &str,
         target: Option<&HostPort>,
     ) {
+        // Canonical names are accepted anywhere a Device ID is accepted.
+        let resolved_agent = self.resolve_agent_reference(agent_name);
+        let agent_name = resolved_agent.as_str();
+
         if let Err(code) = self.authorize_connect(client_name, agent_name) {
             send_connect_response(&mut client_send, "", ResultStatus::Err(code)).await;
             return;

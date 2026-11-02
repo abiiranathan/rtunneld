@@ -112,6 +112,15 @@ enum Command {
         #[arg(long, default_value = "/var/lib/rtunnel")]
         state_dir: PathBuf,
     },
+    /// Assign a canonical display name to a peer.
+    Name {
+        /// Device ID, enrollment name, or existing canonical name.
+        device: String,
+        /// New canonical name matching `[a-z0-9-]{1,63}`.
+        name: String,
+        #[arg(long, default_value = "/var/lib/rtunnel")]
+        state_dir: PathBuf,
+    },
     /// Revoke a peer by name or certificate fingerprint.
     Revoke {
         name: String,
@@ -558,13 +567,46 @@ async fn main() -> Result<()> {
         Command::PeersList { state_dir } => {
             let db = SqliteStore::open(state_dir.join("rtunnel.db"))?;
             let peers = db.list_peers()?;
-            println!("{:<15} {:<8} {:<8} FINGERPRINT", "NAME", "ROLE", "REVOKED");
+            println!(
+                "{:<15} {:<20} {:<8} {:<8} FINGERPRINT",
+                "DEVICE ID", "NAME", "ROLE", "REVOKED"
+            );
             for p in peers {
                 println!(
-                    "{:<15} {:<8} {:<8} {}",
-                    p.name, p.role, p.revoked, p.fingerprint
+                    "{:<15} {:<20} {:<8} {:<8} {}",
+                    p.name,
+                    p.display_name.as_deref().unwrap_or("-"),
+                    p.role,
+                    p.revoked,
+                    p.fingerprint
                 );
             }
+        }
+        Command::Name {
+            device,
+            name,
+            state_dir,
+        } => {
+            if !is_valid_name(&name) {
+                bail!("name must match [a-z0-9-]{{1,63}}");
+            }
+            let db = SqliteStore::open(state_dir.join("rtunnel.db"))?;
+            let peer = db
+                .get_peer_by_name(&device)?
+                .or(db.get_peer_by_display_name(&device)?)
+                .context(format!("peer '{device}' not found"))?;
+            if db.display_name_conflict(&peer.name, &name)? {
+                bail!("name '{name}' is already used by another peer");
+            }
+            db.set_display_name(&peer.name, Some(&name))?;
+            let audit = AuditLogger::open(&state_dir)?;
+            audit.log_name_change(&peer.name, &name);
+
+            println!(
+                "Named device {} '{}'.",
+                rtunnel_proto::format_device_id(&peer.name),
+                name
+            );
         }
         Command::Revoke { name, state_dir } => {
             let db = SqliteStore::open(state_dir.join("rtunnel.db"))?;

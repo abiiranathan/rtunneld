@@ -15,7 +15,10 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
+crossterm = { workspace = true }
 directories = { workspace = true }
+futures-util = { workspace = true }
+ratatui = { workspace = true }
 serde = { workspace = true }
 rustls = { workspace = true }
 thiserror = { workspace = true }

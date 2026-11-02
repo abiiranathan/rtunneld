@@ -3,11 +3,23 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
+use crossterm::cursor::{Hide, Show};
+use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind};
+use crossterm::execute;
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
 use directories::BaseDirs;
 #[cfg(not(windows))]
 use directories::ProjectDirs;
+use futures_util::StreamExt;
 use quinn::Connection;
 use rand::Rng;
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap};
 use rtunnel_agent::{AgentConfig, AgentRunner};
 use rtunnel_client::ClientConfig;
 use rtunnel_identity::{
@@ -15,7 +27,7 @@ use rtunnel_identity::{
     hex_encode, is_valid_name, load_identity, save_identity,
 };
 use rtunnel_proto::{
-    ALPN_ENROLL, ALPN_RENDEZVOUS, AgentDetail, ControlMessage, ErrorCode, GrantDuration, HostPort,
+    ALPN_ENROLL, ALPN_RENDEZVOUS, ControlMessage, ErrorCode, GrantDuration, HostPort, NamedAgent,
     ResultStatus, format_device_id, normalize_device_id,
 };
 use rtunnel_transport::{
@@ -65,6 +77,9 @@ enum Command {
         /// Optional pinned SPKI relay fingerprint. If omitted, Trust On First Use (TOFU) is used.
         #[arg(long)]
         relay_fingerprint: Option<String>,
+        /// Optional canonical name other devices use to reach this machine.
+        #[arg(long)]
+        name: Option<String>,
     },
     /// Print the local Device ID and state directory.
     Id,
@@ -115,6 +130,17 @@ enum Command {
     },
     /// Query relay for accessible devices.
     Agents,
+    /// Show or set this device's relay-side canonical name.
+    Name {
+        /// New canonical name matching `[a-z0-9-]{1,63}`. Omit to print the current name.
+        name: Option<String>,
+    },
+    /// Browse reachable devices and SSH into one interactively.
+    Tui {
+        /// Remote SSH user. Defaults to your local username or the OpenSSH config.
+        #[arg(long)]
+        user: Option<String>,
+    },
     /// Generate OpenSSH host config blocks.
     SshConfig {
         agent: Option<String>,
@@ -204,6 +230,27 @@ async fn dial_relay(
         .connect_with(client_config, relay_addr, host)?
         .await
         .context(handshake_context)
+}
+
+/// Sends `SetDisplayName` on the rendezvous connection and waits for the ack.
+///
+/// # Errors
+///
+/// Returns an error when the stream cannot be opened, the relay rejects the
+/// name, or the relay sends an unexpected frame.
+async fn set_display_name_on_relay(connection: &Connection, name: &str) -> Result<()> {
+    let (mut send, mut recv) = connection.open_bi().await?;
+    let request = ControlMessage::SetDisplayName {
+        name: name.to_owned(),
+    };
+    write_frame(&mut send, &request).await?;
+    match read_frame(&mut recv).await? {
+        ControlMessage::SetDisplayNameAck { .. } => Ok(()),
+        ControlMessage::Error { code, message } => {
+            bail!("relay rejected canonical name: {code} - {message}");
+        }
+        other => bail!("unexpected relay response to SetDisplayName: {other:?}"),
+    }
 }
 
 fn default_client_bin_dir() -> Result<PathBuf> {
@@ -344,6 +391,7 @@ async fn enroll(state_dir: &Path, uri: &str) -> Result<()> {
         relay_port: parsed_uri.port,
         relay_fingerprint: parsed_uri.relay_fingerprint,
         client_name: name,
+        display_name: None,
     };
     config.save(state_dir)?;
 
@@ -362,7 +410,14 @@ async fn run_setup(
     relay_host: &str,
     relay_port: u16,
     relay_fingerprint: Option<String>,
+    name: Option<String>,
 ) -> Result<()> {
+    if let Some(name) = name.as_deref()
+        && !is_valid_name(name)
+    {
+        bail!("name must match [a-z0-9-]{{1,63}}");
+    }
+
     println!("=== rtunnel Instant Setup ===");
     rtunnel_install::create_private_dir(state_dir)?;
 
@@ -428,11 +483,18 @@ async fn run_setup(
         _ => bail!("unexpected response from relay"),
     };
 
+    if let Some(name) = name.as_deref() {
+        set_display_name_on_relay(&connection, name)
+            .await
+            .with_context(|| format!("could not set canonical name '{name}'"))?;
+    }
+
     let config = ClientConfig {
         relay_host: relay_host.to_string(),
         relay_port,
         relay_fingerprint: captured_relay_fp.clone(),
         client_name: device_id.clone(),
+        display_name: name,
     };
     config.save(state_dir)?;
 
@@ -542,6 +604,11 @@ async fn run_host_rendezvous(
     code_hash: &mut String,
     code_str: &mut String,
 ) -> Result<()> {
+    // Pick up names changed with `rtunnel name` while the host was running.
+    if let Ok(disk_config) = ClientConfig::load(state_dir) {
+        config.display_name = disk_config.display_name;
+    }
+
     let verifier = Arc::new(PinnedServerVerifier::new(&config.relay_fingerprint));
     let connection = dial_relay(
         &config.relay_host,
@@ -576,6 +643,14 @@ async fn run_host_rendezvous(
         );
         config.client_name.clone_from(&device_id);
         config.save(state_dir)?;
+    }
+
+    if let Some(name) = config.display_name.clone() {
+        if let Err(error) = set_display_name_on_relay(&connection, &name).await {
+            eprintln!("rtunnel: warning: {error:#}");
+        } else {
+            println!("Canonical name: {name}");
+        }
     }
 
     // Publish the one-time access code (the relay stores only its hash).
@@ -828,7 +903,42 @@ async fn run_connect(
     }
 }
 
-async fn fetch_agents(state_dir: &Path) -> Result<Vec<AgentDetail>> {
+/// Prints or changes this device's canonical name on the relay.
+async fn run_name(state_dir: &Path, name: Option<String>) -> Result<()> {
+    let (mut config, id) = load_client_state(state_dir)?;
+
+    let Some(name) = name else {
+        println!("Device ID: {}", format_device_id(&config.client_name));
+        println!(
+            "Canonical name: {}",
+            config.display_name.as_deref().unwrap_or("(not set)")
+        );
+        return Ok(());
+    };
+
+    if !is_valid_name(&name) {
+        bail!("name must match [a-z0-9-]{{1,63}}");
+    }
+
+    let verifier = Arc::new(PinnedServerVerifier::new(&config.relay_fingerprint));
+    let connection = dial_relay(
+        &config.relay_host,
+        config.relay_port,
+        &id,
+        verifier,
+        ALPN_RENDEZVOUS,
+    )
+    .await?;
+
+    set_display_name_on_relay(&connection, &name).await?;
+    config.display_name = Some(name.clone());
+    config.save(state_dir)?;
+
+    println!("Canonical name set to '{name}'.");
+    Ok(())
+}
+
+async fn fetch_agents(state_dir: &Path) -> Result<Vec<NamedAgent>> {
     let (config, id) = load_client_state(state_dir)?;
 
     let verifier = Arc::new(PinnedServerVerifier::new(&config.relay_fingerprint));
@@ -842,14 +952,36 @@ async fn fetch_agents(state_dir: &Path) -> Result<Vec<AgentDetail>> {
     .await?;
 
     let (mut send, mut recv) = connection.open_bi().await?;
+    let req = ControlMessage::ListAgentsNamed {
+        client_name: config.client_name.clone(),
+    };
+    write_frame(&mut send, &req).await?;
+
+    match read_frame(&mut recv).await? {
+        ControlMessage::AgentsNamedResponse { agents } => return Ok(agents),
+        ControlMessage::Error { .. } => {}
+        other => bail!("unexpected response from relay: {other:?}"),
+    }
+
+    // Fall back to the protocol revision 2 message for relays without names.
+    let (mut send, mut recv) = connection.open_bi().await?;
     let req = ControlMessage::ListAgentsDetailed {
         client_name: config.client_name.clone(),
     };
     write_frame(&mut send, &req).await?;
 
     match read_frame(&mut recv).await? {
-        ControlMessage::AgentsDetailedResponse { agents } => Ok(agents),
+        ControlMessage::AgentsDetailedResponse { agents } => Ok(agents
+            .into_iter()
+            .map(|agent| NamedAgent {
+                name: agent.name,
+                display_name: None,
+                online: agent.online,
+                targets: agent.targets,
+            })
+            .collect()),
         ControlMessage::Error { .. } => {
+            // Revision 1 relay: only the original listing is understood.
             let (mut send, mut recv) = connection.open_bi().await?;
             let req = ControlMessage::ListAgents {
                 client_name: config.client_name,
@@ -858,9 +990,10 @@ async fn fetch_agents(state_dir: &Path) -> Result<Vec<AgentDetail>> {
             match read_frame(&mut recv).await? {
                 ControlMessage::ListAgentsResponse { agents } => Ok(agents
                     .into_iter()
-                    .map(|a| AgentDetail {
-                        name: a.name,
-                        online: a.online,
+                    .map(|agent| NamedAgent {
+                        name: agent.name,
+                        display_name: None,
+                        online: agent.online,
                         targets: Vec::new(),
                     })
                     .collect()),
@@ -871,46 +1004,410 @@ async fn fetch_agents(state_dir: &Path) -> Result<Vec<AgentDetail>> {
     }
 }
 
-/// Prints every granted device, its online status, and its advertised targets.
+/// Prints every granted device, its canonical name, online status, and targets.
 async fn list_agents(state_dir: &Path) -> Result<()> {
     let agents = fetch_agents(state_dir).await?;
 
     println!(
-        "{:<24} {:<8} {:<20} OTHER TARGETS",
-        "DEVICE ID", "STATUS", "DEFAULT TARGET"
+        "{:<20} {:<15} {:<8} {:<20} OTHER TARGETS",
+        "NAME", "DEVICE ID", "STATUS", "DEFAULT TARGET"
     );
-    for a in agents {
-        let status = if a.online { "online" } else { "offline" };
-        let default = a
+    for agent in agents {
+        let status = if agent.online { "online" } else { "offline" };
+        let default = agent
             .targets
             .first()
             .map_or_else(|| String::from("-"), Clone::clone);
-        let others = if a.targets.len() > 1 {
-            a.targets[1..].join(", ")
+        let others = if agent.targets.len() > 1 {
+            agent.targets[1..].join(", ")
         } else {
             String::from("-")
         };
         println!(
-            "{:<24} {status:<8} {default:<20} {others}",
-            format_device_id(&a.name)
+            "{:<20} {:<15} {status:<8} {default:<20} {others}",
+            agent.display_name.as_deref().unwrap_or("-"),
+            format_device_id(&agent.name)
         );
     }
     Ok(())
 }
 
+/// Interactive device browser used by `rtunnel tui`.
+struct TuiApp {
+    agents: Vec<NamedAgent>,
+    table: TableState,
+    target_index: usize,
+    status: String,
+}
+
+impl TuiApp {
+    fn new(mut agents: Vec<NamedAgent>) -> Self {
+        agents.sort_by(|left, right| left.label().cmp(right.label()));
+        let mut table = TableState::default();
+        if !agents.is_empty() {
+            table.select(Some(0));
+        }
+        Self {
+            agents,
+            table,
+            target_index: 0,
+            status: String::from("Select a device and press Enter to connect."),
+        }
+    }
+
+    fn replace_agents(&mut self, mut agents: Vec<NamedAgent>) {
+        agents.sort_by(|left, right| left.label().cmp(right.label()));
+        let selected = self.selected_agent().map(|agent| agent.name.clone());
+        self.agents = agents;
+        self.target_index = 0;
+        let index = selected
+            .and_then(|name| self.agents.iter().position(|agent| agent.name == name))
+            .unwrap_or(0)
+            .min(self.agents.len().saturating_sub(1));
+        if self.agents.is_empty() {
+            self.table.select(None);
+        } else {
+            self.table.select(Some(index));
+        }
+    }
+
+    fn selected_agent(&self) -> Option<&NamedAgent> {
+        self.table
+            .selected()
+            .and_then(|index| self.agents.get(index))
+    }
+
+    fn select_next(&mut self) {
+        if self.agents.is_empty() {
+            return;
+        }
+        let next = self
+            .table
+            .selected()
+            .map_or(0, |index| (index + 1) % self.agents.len());
+        self.table.select(Some(next));
+        self.target_index = 0;
+    }
+
+    fn select_previous(&mut self) {
+        if self.agents.is_empty() {
+            return;
+        }
+        let previous = self.table.selected().map_or(0, |index| {
+            if index == 0 {
+                self.agents.len() - 1
+            } else {
+                index - 1
+            }
+        });
+        self.table.select(Some(previous));
+        self.target_index = 0;
+    }
+
+    fn target_count(&self) -> usize {
+        self.selected_agent()
+            .map_or(1, |agent| agent.targets.len().max(1))
+    }
+
+    fn target_next(&mut self) {
+        let count = self.target_count();
+        self.target_index = (self.target_index + 1) % count;
+    }
+
+    fn target_previous(&mut self) {
+        let count = self.target_count();
+        self.target_index = if self.target_index == 0 {
+            count - 1
+        } else {
+            self.target_index - 1
+        };
+    }
+
+    fn selected_target(&self) -> Option<&str> {
+        if self.target_index == 0 {
+            return None;
+        }
+        self.selected_agent()
+            .and_then(|agent| agent.targets.get(self.target_index))
+            .map(String::as_str)
+    }
+
+    fn target_label(&self) -> String {
+        let Some(agent) = self.selected_agent() else {
+            return String::from("-");
+        };
+        if self.target_index == 0 {
+            agent
+                .targets
+                .first()
+                .map_or_else(|| String::from("(agent default)"), Clone::clone)
+        } else {
+            agent
+                .targets
+                .get(self.target_index)
+                .map_or_else(|| String::from("(agent default)"), Clone::clone)
+        }
+    }
+}
+
+/// Restores the terminal when a TUI session ends, including early returns.
+struct TerminalGuard;
+
+impl TerminalGuard {
+    fn enter() -> std::io::Result<Self> {
+        enable_raw_mode()?;
+        let mut stdout = std::io::stdout();
+        if let Err(error) = execute!(stdout, EnterAlternateScreen, Hide) {
+            let _ = disable_raw_mode();
+            return Err(error);
+        }
+        Ok(Self)
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        if let Err(error) = disable_raw_mode() {
+            eprintln!("rtunnel: cannot leave raw mode: {error}");
+        }
+        if let Err(error) = execute!(std::io::stdout(), LeaveAlternateScreen, Show) {
+            eprintln!("rtunnel: cannot restore the terminal screen: {error}");
+        }
+    }
+}
+
+fn target_summary(agent: &NamedAgent) -> String {
+    match agent.targets.as_slice() {
+        [] => String::from("-"),
+        [only] => only.clone(),
+        [first, rest @ ..] => format!("{first} (+{})", rest.len()),
+    }
+}
+
+fn draw_tui(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(3),
+            Constraint::Length(3),
+        ])
+        .split(frame.area());
+
+    let title = Paragraph::new("Pick a device, then press Enter to open SSH.")
+        .style(Style::default().fg(Color::Cyan))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" rtunnel devices "),
+        );
+    frame.render_widget(title, chunks[0]);
+
+    let rows: Vec<Row<'_>> = app
+        .agents
+        .iter()
+        .map(|agent| {
+            let status = if agent.online { "online" } else { "offline" };
+            let status_style = if agent.online {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            Row::new(vec![
+                Cell::from(agent.display_name.as_deref().unwrap_or("-").to_owned()),
+                Cell::from(format_device_id(&agent.name)),
+                Cell::from(status).style(status_style),
+                Cell::from(target_summary(agent)),
+            ])
+        })
+        .collect();
+
+    let header = Row::new(vec!["NAME", "DEVICE ID", "STATUS", "TARGET"])
+        .style(Style::default().add_modifier(Modifier::BOLD));
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(24),
+            Constraint::Length(14),
+            Constraint::Length(9),
+            Constraint::Min(20),
+        ],
+    )
+    .header(header)
+    .block(Block::default().borders(Borders::ALL).title(" Devices "))
+    .row_highlight_style(
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )
+    .highlight_symbol("> ");
+    frame.render_stateful_widget(table, chunks[1], &mut app.table);
+
+    let help = format!(
+        "{}\nTarget: {}    Up/Down select  Left/Right target  Enter SSH  r refresh  q quit",
+        app.status,
+        app.target_label()
+    );
+    let footer = Paragraph::new(help)
+        .style(Style::default().fg(Color::Gray))
+        .wrap(Wrap { trim: true })
+        .block(Block::default().borders(Borders::ALL));
+    frame.render_widget(footer, chunks[2]);
+}
+
+/// Quotes one `ProxyCommand` token for the platform shell OpenSSH uses.
+fn shell_quote(value: &str) -> String {
+    if value
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || "/._-:".contains(character))
+    {
+        return value.to_owned();
+    }
+    if cfg!(windows) {
+        format!("\"{}\"", value.replace('"', "\\\""))
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+/// Chooses the OpenSSH host alias shown in `known_hosts` for a TUI selection.
+fn tui_ssh_alias(agent: &NamedAgent, target: Option<&str>) -> String {
+    let label = agent.label().to_owned();
+    let Some(target) = target else {
+        return label;
+    };
+    let mut used = BTreeSet::from([label.clone(), agent.name.clone()]);
+    target_alias(&label, target, &mut used).unwrap_or(label)
+}
+
+/// Suspends the TUI, runs OpenSSH with this binary as its `ProxyCommand`, and
+/// returns the SSH exit code.
+async fn ssh_into_agent(
+    agent: &NamedAgent,
+    target: Option<&str>,
+    user: Option<&str>,
+) -> Result<i32> {
+    let executable = std::env::current_exe().context("cannot locate the rtunnel executable")?;
+    let executable = executable.to_string_lossy();
+    let mut proxy = format!("{} connect {}", shell_quote(&executable), agent.name);
+    if let Some(target) = target {
+        proxy.push(' ');
+        proxy.push_str(&shell_quote(target));
+    }
+
+    let alias = tui_ssh_alias(agent, target);
+    let mut command = tokio::process::Command::new("ssh");
+    if let Some(user) = user {
+        command.arg("-l").arg(user);
+    }
+    command
+        .arg("-o")
+        .arg(format!("ProxyCommand={proxy}"))
+        .arg(&alias);
+
+    let status = command
+        .status()
+        .await
+        .context("failed to launch ssh; is OpenSSH installed and on PATH?")?;
+    Ok(status.code().unwrap_or(EXIT_FAILURE))
+}
+
+async fn refresh_tui(app: &mut TuiApp, state_dir: &Path) {
+    match fetch_agents(state_dir).await {
+        Ok(agents) => {
+            app.replace_agents(agents);
+            app.status = String::from("Device list refreshed.");
+        }
+        Err(error) => {
+            app.status = format!("Could not refresh devices: {error:#}");
+        }
+    }
+}
+
+async fn run_tui(state_dir: &Path, user: Option<String>) -> Result<()> {
+    let agents = fetch_agents(state_dir)
+        .await
+        .context("cannot load devices for the TUI")?;
+    let mut app = TuiApp::new(agents);
+    let mut events = EventStream::new();
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    let mut guard = TerminalGuard::enter().context("cannot initialize the terminal")?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
+
+    loop {
+        terminal.draw(|frame| draw_tui(frame, &mut app))?;
+
+        tokio::select! {
+            maybe_event = events.next() => {
+                let Some(event) = maybe_event else {
+                    break;
+                };
+                let event = event.context("cannot read a terminal event")?;
+                if let Event::Key(key) = event
+                    && key.kind == KeyEventKind::Press
+                {
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => break,
+                        KeyCode::Up | KeyCode::Char('k') => app.select_previous(),
+                        KeyCode::Down | KeyCode::Char('j') => app.select_next(),
+                        KeyCode::Left | KeyCode::Char('h') => app.target_previous(),
+                        KeyCode::Right | KeyCode::Char('l') => app.target_next(),
+                        KeyCode::Char('r') => refresh_tui(&mut app, state_dir).await,
+                        KeyCode::Enter => {
+                            let Some(agent) = app.selected_agent().cloned() else {
+                                continue;
+                            };
+                            let target = app.selected_target().map(str::to_owned);
+
+                            // Hand the terminal back to OpenSSH, then rebuild
+                            // the TUI once the session exits.
+                            terminal.show_cursor()?;
+                            drop(terminal);
+                            drop(guard);
+
+                            let result = ssh_into_agent(&agent, target.as_deref(), user.as_deref()).await;
+
+                            guard = TerminalGuard::enter()
+                                .context("cannot re-enter the terminal after SSH")?;
+                            terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
+                            app.status = match result {
+                                Ok(0) => format!("SSH session to {} closed.", agent.label()),
+                                Ok(code) => format!(
+                                    "SSH session to {} exited with status {code}.",
+                                    agent.label()
+                                ),
+                                Err(error) => format!("Could not start SSH: {error:#}"),
+                            };
+                            refresh_tui(&mut app, state_dir).await;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ = ticker.tick() => {
+                refresh_tui(&mut app, state_dir).await;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Looks up a device's advertised targets, warning instead of failing when the
 /// relay is unreachable or predates target discovery.
-async fn resolve_agent_targets(state_dir: &Path, agent: &str) -> Vec<String> {
+async fn resolve_agent(state_dir: &Path, agent: &str) -> Option<NamedAgent> {
     match fetch_agents(state_dir).await {
-        Ok(agents) => agents
-            .into_iter()
-            .find(|a| a.name == agent)
-            .map_or_else(Vec::new, |a| a.targets),
+        Ok(agents) => agents.into_iter().find(|candidate| {
+            candidate.name == agent || candidate.display_name.as_deref() == Some(agent)
+        }),
         Err(e) => {
             eprintln!(
-                "warning: could not discover targets for '{agent}' ({e:#}); using the default target"
+                "warning: could not discover device '{agent}' ({e:#}); using the default target"
             );
-            Vec::new()
+            None
         }
     }
 }
@@ -921,16 +1418,26 @@ async fn print_ssh_config(state_dir: &Path, agent: &str, target: Option<&str>) -
         bail!("device ID or agent name must match [a-z0-9-]{{1,63}}");
     }
 
+    let resolved = resolve_agent(state_dir, agent).await;
+    let device_id = resolved
+        .as_ref()
+        .map_or_else(|| agent.to_string(), |found| found.name.clone());
+    let label = resolved
+        .as_ref()
+        .and_then(|found| found.display_name.clone())
+        .unwrap_or_else(|| device_id.clone());
+
     let hosts = if let Some(dest) = target {
         HostPort::parse(dest)
             .map_err(|_| anyhow!("invalid target host:port specification: {dest}"))?;
         vec![SshHost {
-            alias: agent.to_string(),
-            agent: agent.to_string(),
+            alias: label,
+            agent: device_id,
             target: Some(dest.to_string()),
         }]
     } else {
-        ssh_hosts(agent, &resolve_agent_targets(state_dir, agent).await)
+        let targets = resolved.map_or_else(Vec::new, |found| found.targets);
+        ssh_hosts(&device_id, &label, &targets)
     };
 
     print!("{}", render_snippets(&hosts));
@@ -952,7 +1459,16 @@ async fn write_ssh_config(
         fetch_agents(state_dir)
             .await?
             .into_iter()
-            .map(|a| (a.name.clone(), ssh_hosts(&a.name, &a.targets)))
+            .map(|agent| {
+                let label = agent
+                    .display_name
+                    .clone()
+                    .unwrap_or_else(|| agent.name.clone());
+                (
+                    label.clone(),
+                    ssh_hosts(&agent.name, &label, &agent.targets),
+                )
+            })
             .collect()
     } else {
         let agent = agent.context("a device ID or agent name is required (or use --all)")?;
@@ -960,18 +1476,28 @@ async fn write_ssh_config(
             bail!("device ID or agent name must match [a-z0-9-]{{1,63}}");
         }
 
+        let resolved = resolve_agent(state_dir, agent).await;
+        let device_id = resolved
+            .as_ref()
+            .map_or_else(|| agent.to_string(), |found| found.name.clone());
+        let label = resolved
+            .as_ref()
+            .and_then(|found| found.display_name.clone())
+            .unwrap_or_else(|| device_id.clone());
+
         let hosts = if let Some(dest) = target {
             HostPort::parse(dest)
                 .map_err(|_| anyhow!("invalid target host:port specification: {dest}"))?;
             vec![SshHost {
-                alias: agent.to_string(),
-                agent: agent.to_string(),
+                alias: label.clone(),
+                agent: device_id,
                 target: Some(dest.to_string()),
             }]
         } else {
-            ssh_hosts(agent, &resolve_agent_targets(state_dir, agent).await)
+            let targets = resolved.map_or_else(Vec::new, |found| found.targets);
+            ssh_hosts(&device_id, &label, &targets)
         };
-        vec![(agent.to_string(), hosts)]
+        vec![(label, hosts)]
     };
 
     let home = BaseDirs::new()
@@ -1004,7 +1530,7 @@ fn ssh_config_snippet(host_alias: &str, agent: &str, target: Option<&str>) -> St
     format!("Host {host_alias}\n    ProxyCommand rtunnel connect {agent}{target_suffix}\n")
 }
 
-fn target_alias(agent: &str, target: &str, used: &mut BTreeSet<String>) -> Option<String> {
+fn target_alias(label: &str, target: &str, used: &mut BTreeSet<String>) -> Option<String> {
     let hp = HostPort::parse(target).ok()?;
     let mut base = hp.host.to_ascii_lowercase();
     if hp.port != 22 {
@@ -1014,7 +1540,7 @@ fn target_alias(agent: &str, target: &str, used: &mut BTreeSet<String>) -> Optio
 
     if base.is_empty()
         || base.len() > 253
-        || base == agent
+        || base == label
         || base.contains(':')
         || base
             .chars()
@@ -1025,30 +1551,30 @@ fn target_alias(agent: &str, target: &str, used: &mut BTreeSet<String>) -> Optio
 
     let mut alias = base.clone();
     if used.contains(&alias) {
-        alias = format!("{agent}-{base}");
+        alias = format!("{label}-{base}");
     }
     let mut suffix = 2_u32;
     while used.contains(&alias) {
-        alias = format!("{agent}-{base}-{suffix}");
+        alias = format!("{label}-{base}-{suffix}");
         suffix += 1;
     }
     used.insert(alias.clone());
     Some(alias)
 }
 
-fn ssh_hosts(agent: &str, targets: &[String]) -> Vec<SshHost> {
-    let mut used = BTreeSet::from([agent.to_string()]);
+fn ssh_hosts(device_id: &str, label: &str, targets: &[String]) -> Vec<SshHost> {
+    let mut used = BTreeSet::from([device_id.to_string(), label.to_string()]);
     let mut hosts = vec![SshHost {
-        alias: agent.to_string(),
-        agent: agent.to_string(),
+        alias: label.to_string(),
+        agent: device_id.to_string(),
         target: None,
     }];
 
     for target in targets.iter().skip(1) {
-        if let Some(alias) = target_alias(agent, target, &mut used) {
+        if let Some(alias) = target_alias(label, target, &mut used) {
             hosts.push(SshHost {
                 alias,
-                agent: agent.to_string(),
+                agent: device_id.to_string(),
                 target: Some(target.clone()),
             });
         }
@@ -1083,15 +1609,19 @@ async fn write_all_ssh_configs(state_dir: &Path) -> Result<Vec<String>> {
 
     let mut written = Vec::new();
     for agent in agents {
-        if !is_valid_name(&agent.name) {
+        let label = agent
+            .display_name
+            .clone()
+            .unwrap_or_else(|| agent.name.clone());
+        if !is_valid_name(&agent.name) || !is_valid_name(&label) {
             continue;
         }
         write_agent_snippet(
             &snippets,
-            &agent.name,
-            &ssh_hosts(&agent.name, &agent.targets),
+            &label,
+            &ssh_hosts(&agent.name, &label, &agent.targets),
         )?;
-        written.push(agent.name);
+        written.push(label);
     }
     Ok(written)
 }
@@ -1130,8 +1660,9 @@ async fn main() -> Result<()> {
             relay_host,
             relay_port,
             relay_fingerprint,
+            name,
         } => {
-            run_setup(&state_dir, &relay_host, relay_port, relay_fingerprint).await?;
+            run_setup(&state_dir, &relay_host, relay_port, relay_fingerprint, name).await?;
         }
         Command::Id => {
             let (config, _) = load_client_state(&state_dir)?;
@@ -1187,6 +1718,12 @@ async fn main() -> Result<()> {
         }
         Command::Agents => {
             list_agents(&state_dir).await?;
+        }
+        Command::Name { name } => {
+            run_name(&state_dir, name).await?;
+        }
+        Command::Tui { user } => {
+            run_tui(&state_dir, user).await?;
         }
         Command::SshConfig {
             agent,

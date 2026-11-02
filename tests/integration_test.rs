@@ -611,6 +611,82 @@ async fn test_agent_advertises_targets_for_client_discovery() {
 }
 
 #[tokio::test]
+async fn test_canonical_name_listing_and_connect() {
+    let harness = TestHarness::start();
+    let (echo_addr, _echo_handle) = start_echo_server().await;
+    let agent_id = harness.enroll_peer("agent-named", "agent").await;
+    let client_id = harness.enroll_peer("client-named", "client").await;
+    harness
+        .store
+        .add_grant("client-named", "agent-named")
+        .unwrap();
+    harness
+        .store
+        .set_display_name("agent-named", Some("workshop-pc"))
+        .unwrap();
+
+    let agent_cfg = AgentConfig {
+        relay_host: harness.relay_addr.ip().to_string(),
+        relay_port: harness.relay_addr.port(),
+        relay_fingerprint: harness.relay_identity.fingerprint.clone(),
+        agent_name: "agent-named".into(),
+        allowed_targets: vec![echo_addr.to_string()],
+        max_sessions: 64,
+    };
+    tokio::spawn(AgentRunner::new(agent_cfg, agent_id).run());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let (_endpoint, connection) = harness
+        .connect_as(&client_id, vec![ALPN_TUNNEL.to_vec()])
+        .await;
+
+    let (mut send, mut recv) = connection.open_bi().await.unwrap();
+    write_frame(
+        &mut send,
+        &ControlMessage::ListAgentsNamed {
+            client_name: "client-named".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let ControlMessage::AgentsNamedResponse { agents } = read_frame(&mut recv).await.unwrap()
+    else {
+        panic!("expected AgentsNamedResponse");
+    };
+    let agent = agents
+        .iter()
+        .find(|agent| agent.name == "agent-named")
+        .expect("granted agent must be listed");
+    assert_eq!(agent.display_name.as_deref(), Some("workshop-pc"));
+    assert!(agent.online);
+    assert_eq!(agent.targets, vec![echo_addr.to_string()]);
+    assert_eq!(agent.label(), "workshop-pc");
+
+    // The canonical name must work anywhere a Device ID or agent name works.
+    let (mut send, mut recv) = connection.open_bi().await.unwrap();
+    write_frame(
+        &mut send,
+        &ControlMessage::ConnectRequest {
+            agent: "workshop-pc".into(),
+            target: Some(HostPort::new(echo_addr.ip().to_string(), echo_addr.port()).unwrap()),
+        },
+    )
+    .await
+    .unwrap();
+    let ControlMessage::ConnectResponse { status, .. } = read_frame(&mut recv).await.unwrap()
+    else {
+        panic!("expected ConnectResponse");
+    };
+    assert_eq!(status, ResultStatus::Ok);
+
+    send.write_all(b"named tunnel").await.unwrap();
+    send.finish().unwrap();
+    let mut received = [0u8; 12];
+    recv.read_exact(&mut received).await.unwrap();
+    assert_eq!(&received, b"named tunnel");
+}
+
+#[tokio::test]
 async fn test_revocation_terminates_agent_live_session() {
     let harness = TestHarness::start();
     let agent_id = harness.enroll_peer("agent-rev", "agent").await;

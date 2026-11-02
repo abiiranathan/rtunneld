@@ -17,11 +17,40 @@ fn current_epoch_seconds() -> i64 {
     i64::try_from(secs).unwrap_or(i64::MAX)
 }
 
+/// Converts a human label such as a hostname into a valid canonical name.
+///
+/// Runs of characters outside `[a-z0-9]` collapse to a single hyphen, leading
+/// and trailing hyphens are removed, and the result is capped at 63 bytes.
+fn canonical_name_candidate(label: &str) -> Option<String> {
+    let mut name = String::with_capacity(label.len().min(63));
+    let mut pending_hyphen = false;
+    for character in label.chars() {
+        if character.is_ascii_alphanumeric() {
+            if pending_hyphen && !name.is_empty() {
+                name.push('-');
+            }
+            pending_hyphen = false;
+            name.push(character.to_ascii_lowercase());
+            if name.len() == 63 {
+                break;
+            }
+        } else if !name.is_empty() {
+            pending_hyphen = true;
+        }
+    }
+    while name.ends_with('-') {
+        name.pop();
+    }
+    (!name.is_empty()).then_some(name)
+}
+
 /// Database record for an enrolled peer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PeerRecord {
     /// Peer unique name or 9-digit Device ID.
     pub name: String,
+    /// Operator-assigned canonical name, when one has been set.
+    pub display_name: Option<String>,
     /// Peer role (`"agent"`, `"client"`, or `"node"`).
     pub role: String,
     /// Pinned `SubjectPublicKeyInfo` hex fingerprint.
@@ -41,6 +70,17 @@ pub struct TokenRecord {
     pub role: String,
     /// Expiry as seconds since the Unix epoch.
     pub expires_at: i64,
+}
+
+/// Decodes one `peers` row in the column order used by every peer query.
+fn peer_from_row(row: &rusqlite::Row<'_>) -> SqliteResult<PeerRecord> {
+    Ok(PeerRecord {
+        name: row.get(0)?,
+        display_name: row.get(1)?,
+        role: row.get(2)?,
+        fingerprint: row.get(3)?,
+        revoked: row.get::<_, i64>(4)? != 0,
+    })
 }
 
 /// SQLite-backed store with thread-safe connection pooling for relay configuration.
@@ -65,11 +105,31 @@ impl SqliteStore {
         conn.execute(
             "CREATE TABLE IF NOT EXISTS peers (
                 name TEXT PRIMARY KEY,
+                display_name TEXT,
                 role TEXT NOT NULL,
                 fingerprint TEXT NOT NULL UNIQUE,
                 revoked INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL
             )",
+            (),
+        )?;
+
+        // Migration for databases created before canonical names existed.
+        let has_display_name: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('peers') WHERE name = 'display_name'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_display_name == 0 {
+            conn.execute("ALTER TABLE peers ADD COLUMN display_name TEXT", ())?;
+        }
+
+        // A canonical name identifies exactly one peer and may not shadow a
+        // Device ID or another canonical name.
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS peers_display_name_unique
+             ON peers(display_name COLLATE NOCASE)
+             WHERE display_name IS NOT NULL",
             (),
         )?;
 
@@ -165,11 +225,23 @@ impl SqliteStore {
             }
         };
 
+        // Give a new device a readable name by default. A hostname such as
+        // "Nabi's-PC" becomes "nabi-s-pc"; the operator can change it later.
+        let display_name = canonical_name_candidate(label).filter(|candidate| {
+            lock.query_row(
+                "SELECT COUNT(*) FROM peers
+                 WHERE name = ?1 OR display_name = ?1 COLLATE NOCASE",
+                [candidate],
+                |row| row.get::<_, i64>(0),
+            )
+            .is_ok_and(|count| count == 0)
+        });
+
         let now = current_epoch_seconds();
         lock.execute(
-            "INSERT INTO peers (name, role, fingerprint, revoked, created_at)
-             VALUES (?1, 'node', ?2, 0, ?3)",
-            params![device_id, fingerprint, now],
+            "INSERT INTO peers (name, display_name, role, fingerprint, revoked, created_at)
+             VALUES (?1, ?2, 'node', ?3, 0, ?4)",
+            params![device_id, display_name, fingerprint, now],
         )?;
 
         // Default grant: each device can connect to its own label
@@ -178,7 +250,6 @@ impl SqliteStore {
             params![device_id, now],
         );
 
-        let _ = label;
         Ok(device_id)
     }
 
@@ -265,14 +336,15 @@ impl SqliteStore {
         let lock = self.conn.lock().expect("lock acquired");
         let now = current_epoch_seconds();
         lock.execute(
-            "INSERT INTO peers (name, role, fingerprint, revoked, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO peers (name, display_name, role, fingerprint, revoked, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(name) DO UPDATE SET
                 role = excluded.role,
                 fingerprint = excluded.fingerprint,
                 revoked = excluded.revoked",
             params![
                 record.name,
+                record.display_name,
                 record.role,
                 record.fingerprint,
                 record.revoked,
@@ -289,18 +361,11 @@ impl SqliteStore {
     /// Returns an error if the query fails or a row cannot be decoded.
     pub fn get_peer_by_fingerprint(&self, fingerprint: &str) -> SqliteResult<Option<PeerRecord>> {
         let lock = self.conn.lock().expect("lock acquired");
-        let mut stmt = lock
-            .prepare("SELECT name, role, fingerprint, revoked FROM peers WHERE fingerprint = ?1")?;
-        let row = stmt
-            .query_row([fingerprint], |r| {
-                Ok(PeerRecord {
-                    name: r.get(0)?,
-                    role: r.get(1)?,
-                    fingerprint: r.get(2)?,
-                    revoked: r.get::<_, i64>(3)? != 0,
-                })
-            })
-            .optional()?;
+        let mut stmt = lock.prepare(
+            "SELECT name, display_name, role, fingerprint, revoked FROM peers
+             WHERE fingerprint = ?1",
+        )?;
+        let row = stmt.query_row([fingerprint], peer_from_row).optional()?;
         Ok(row)
     }
 
@@ -311,19 +376,66 @@ impl SqliteStore {
     /// Returns an error if the query fails or a row cannot be decoded.
     pub fn get_peer_by_name(&self, name: &str) -> SqliteResult<Option<PeerRecord>> {
         let lock = self.conn.lock().expect("lock acquired");
-        let mut stmt =
-            lock.prepare("SELECT name, role, fingerprint, revoked FROM peers WHERE name = ?1")?;
-        let row = stmt
-            .query_row([name], |r| {
-                Ok(PeerRecord {
-                    name: r.get(0)?,
-                    role: r.get(1)?,
-                    fingerprint: r.get(2)?,
-                    revoked: r.get::<_, i64>(3)? != 0,
-                })
-            })
-            .optional()?;
+        let mut stmt = lock.prepare(
+            "SELECT name, display_name, role, fingerprint, revoked FROM peers
+             WHERE name = ?1",
+        )?;
+        let row = stmt.query_row([name], peer_from_row).optional()?;
         Ok(row)
+    }
+
+    /// Looks up a peer by its canonical display name, ignoring case.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails or a row cannot be decoded.
+    pub fn get_peer_by_display_name(&self, name: &str) -> SqliteResult<Option<PeerRecord>> {
+        let lock = self.conn.lock().expect("lock acquired");
+        let mut stmt = lock.prepare(
+            "SELECT name, display_name, role, fingerprint, revoked FROM peers
+             WHERE display_name = ?1 COLLATE NOCASE",
+        )?;
+        let row = stmt.query_row([name], peer_from_row).optional()?;
+        Ok(row)
+    }
+
+    /// Reports whether `name` is already used as a Device ID or canonical name
+    /// by a peer other than `device_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lookup query fails.
+    pub fn display_name_conflict(&self, device_id: &str, name: &str) -> SqliteResult<bool> {
+        let lock = self.conn.lock().expect("lock acquired");
+        let count: i64 = lock.query_row(
+            "SELECT COUNT(*) FROM peers
+             WHERE name <> ?1
+               AND (name = ?2 COLLATE NOCASE OR display_name = ?2 COLLATE NOCASE)",
+            params![device_id, name],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Sets or clears the canonical name of `device_id`.
+    ///
+    /// Returns `true` when the peer exists and was updated.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the update fails, for example when another peer
+    /// already owns the name.
+    pub fn set_display_name(
+        &self,
+        device_id: &str,
+        display_name: Option<&str>,
+    ) -> SqliteResult<bool> {
+        let lock = self.conn.lock().expect("lock acquired");
+        let updated = lock.execute(
+            "UPDATE peers SET display_name = ?1 WHERE name = ?2",
+            params![display_name, device_id],
+        )?;
+        Ok(updated > 0)
     }
 
     /// Lists all enrolled peers ordered by name.
@@ -333,16 +445,11 @@ impl SqliteStore {
     /// Returns an error if the query fails or any row cannot be decoded.
     pub fn list_peers(&self) -> SqliteResult<Vec<PeerRecord>> {
         let lock = self.conn.lock().expect("lock acquired");
-        let mut stmt =
-            lock.prepare("SELECT name, role, fingerprint, revoked FROM peers ORDER BY name ASC")?;
-        let rows = stmt.query_map([], |r| {
-            Ok(PeerRecord {
-                name: r.get(0)?,
-                role: r.get(1)?,
-                fingerprint: r.get(2)?,
-                revoked: r.get::<_, i64>(3)? != 0,
-            })
-        })?;
+        let mut stmt = lock.prepare(
+            "SELECT name, display_name, role, fingerprint, revoked FROM peers
+             ORDER BY COALESCE(display_name, name) ASC",
+        )?;
+        let rows = stmt.query_map([], peer_from_row)?;
         rows.collect()
     }
 
@@ -568,5 +675,96 @@ impl SqliteStore {
             let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
             rows.collect()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn allocates_and_resolves_canonical_names() {
+        let dir = tempdir().expect("temporary state directory");
+        let store = SqliteStore::open(dir.path().join("test.db")).expect("open store");
+
+        let first = store
+            .get_or_allocate_device_id("fingerprint-a", "Clinic A")
+            .expect("allocate first device");
+        let peer = store
+            .get_peer_by_name(&first)
+            .expect("lookup first device")
+            .expect("first device exists");
+        assert_eq!(peer.display_name.as_deref(), Some("clinic-a"));
+
+        let second = store
+            .get_or_allocate_device_id("fingerprint-b", "Clinic A")
+            .expect("allocate second device");
+        let peer = store
+            .get_peer_by_name(&second)
+            .expect("lookup second device")
+            .expect("second device exists");
+        assert_eq!(peer.display_name, None, "duplicate labels stay unnamed");
+
+        assert!(
+            !store
+                .display_name_conflict(&first, "clinic-a")
+                .expect("conflict query")
+        );
+        assert!(
+            store
+                .display_name_conflict(&second, "clinic-a")
+                .expect("conflict query")
+        );
+
+        assert!(
+            store
+                .set_display_name(&second, Some("workshop-pc"))
+                .expect("set display name")
+        );
+        let resolved = store
+            .get_peer_by_display_name("WORKSHOP-PC")
+            .expect("lookup by name")
+            .expect("name resolves case-insensitively");
+        assert_eq!(resolved.name, second);
+    }
+
+    #[test]
+    fn migrates_databases_without_display_names() {
+        let dir = tempdir().expect("temporary state directory");
+        let path = dir.path().join("legacy.db");
+        let connection = Connection::open(&path).expect("open legacy database");
+        connection
+            .execute(
+                "CREATE TABLE peers (
+                    name TEXT PRIMARY KEY,
+                    role TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL UNIQUE,
+                    revoked INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL
+                )",
+                (),
+            )
+            .expect("create legacy peers table");
+        connection
+            .execute(
+                "INSERT INTO peers (name, role, fingerprint, revoked, created_at)
+                 VALUES ('482913077', 'node', 'fingerprint-a', 0, 0)",
+                (),
+            )
+            .expect("insert legacy peer");
+        drop(connection);
+
+        let store = SqliteStore::open(&path).expect("migrate store");
+        assert!(
+            store
+                .set_display_name("482913077", Some("home-pc"))
+                .expect("set name after migration")
+        );
+        let peer = store
+            .get_peer_by_name("482913077")
+            .expect("lookup")
+            .expect("peer exists");
+        assert_eq!(peer.display_name.as_deref(), Some("home-pc"));
     }
 }

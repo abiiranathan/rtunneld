@@ -178,6 +178,24 @@ impl AuditLogger {
         });
     }
 
+    /// Logs a canonical peer name assignment.
+    pub fn log_name_change(&self, device_id: &str, name: &str) {
+        self.write_record(&AuditRecord {
+            timestamp: Utc::now().to_rfc3339(),
+            event: "name_change",
+            client: None,
+            agent: None,
+            target: Some(device_id),
+            session_id: None,
+            bytes_up: None,
+            bytes_down: None,
+            duration_ms: None,
+            reason: Some(name),
+            fingerprint: None,
+            action: Some("set"),
+        });
+    }
+
     /// Logs a revocation event.
     pub fn log_revoke(&self, target: &str) {
         self.write_record(&AuditRecord {

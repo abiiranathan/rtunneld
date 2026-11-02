@@ -16,6 +16,9 @@ pub struct ClientConfig {
     pub relay_fingerprint: String,
     /// Name assigned to this client upon enrollment.
     pub client_name: String,
+    /// Canonical display name shared with other devices through the relay.
+    #[serde(default)]
+    pub display_name: Option<String>,
 }
 
 impl ClientConfig {

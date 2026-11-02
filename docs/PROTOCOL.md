@@ -61,6 +61,10 @@ a Postcard-serialized `ControlMessage` payload:
 - `AgentTargets { targets: Vec<String> }`
 - `ListAgentsDetailed { client_name }`
 - `AgentsDetailedResponse { agents: Vec<AgentDetail> }`
+- `SetDisplayName { name }`
+- `SetDisplayNameAck { name }`
+- `ListAgentsNamed { client_name }`
+- `AgentsNamedResponse { agents: Vec<NamedAgent> }`
 
 ## 2.1 Target Discovery (Protocol Minor 2)
 
@@ -130,8 +134,43 @@ Grant persistence:
 
 After a successful pairing the client sends `ConnectRequest` on the same
 rendezvous connection. The rendezvous handler and the authenticated client
-tunnel handler both accept `ConnectRequest`, `ListAgents`, and
-`ListAgentsDetailed`, so discovery works over either ALPN.
+tunnel handler both accept `ConnectRequest`, `ListAgents`, `ListAgentsDetailed`,
+and `ListAgentsNamed`, so discovery works over either ALPN.
+
+## 2.3 Canonical Peer Names (Protocol Minor 5)
+
+Device IDs are stable but hard to remember, so peers may also carry a canonical
+name. The name is relay-side metadata attached to the stable peer record; it
+never changes the Device ID, fingerprint, grants, or audit identity.
+
+- **Registration default**: when a new peer registers with `RegisterDevice`,
+  the relay lowercases its `label`, collapses non-alphanumeric runs to single
+  hyphens, trims hyphens, and truncates to 63 bytes. If that slug is non-empty
+  and does not collide case-insensitively with an existing peer name or display
+  name, it becomes the initial canonical name. A collision leaves the peer
+  unnamed rather than appending a suffix.
+- **Renaming**: `SetDisplayName { name }` is accepted on the rendezvous or
+  authenticated tunnel ALPN and applies to the peer identified by the pinned
+  TLS certificate fingerprint, not to a name supplied in the message. The relay
+  validates `[a-z0-9-]{1,63}` and requires case-insensitive uniqueness against
+  both stable names and other display names. It replies with
+  `SetDisplayNameAck { name }`, or an `Error` with `InvalidName` or `NameTaken`.
+  Renaming is recorded in the audit log.
+- **Named listing**: `ListAgentsNamed` returns `AgentsNamedResponse` with
+  `NamedAgent { name, display_name, online, targets }`. `name` remains the
+  stable Device ID or enrollment name; `display_name` is absent when the peer
+  has no canonical name. Clients should display `display_name` when present and
+  fall back to `name`.
+- **Alias resolution**: wherever an agent reference is accepted — notably
+  `ConnectRequest.agent` and the pairing target — the relay first tries an exact
+  stable-name match, then a case-insensitive display-name match. Grants and
+  authorization still use the resolved stable name, so a rename cannot widen
+  access. Unknown references pass through unchanged.
+- **Compatibility**: these are appended enum variants, so peers must understand
+  them; there is no partial decoding. A revision 5 client tries
+  `ListAgentsNamed` first, falls back to `ListAgentsDetailed` if the relay
+  rejects the unknown frame, then to `ListAgents`. Revision 5 relays continue to
+  answer the older listing messages without canonical names.
 
 ## 3. Stream Splicing & Teardown
 
@@ -148,12 +187,15 @@ transparent bidirectional byte pipe:
 
 ## 4. Versioning and Compatibility
 
-`PROTOCOL_MINOR` is currently `4`:
+`PROTOCOL_MINOR` is currently `5`:
 
 - Revision 2 added agent target discovery (`AgentTargets`).
 - Revision 3 added rendezvous Device IDs, SAS pairing, and dynamic grants.
 - Revision 4 added the early `PairPending` notice so both operators can compare
   the SAS before either side approves the request.
+- Revision 5 added relay-side canonical names (`SetDisplayName`,
+  `SetDisplayNameAck`, `ListAgentsNamed`, `AgentsNamedResponse`, `NamedAgent`)
+  and the `NameTaken` / `InvalidName` error codes.
 
 Control messages are Postcard-serialized enums; unknown variants are not
 forward-compatible. Consequently the relay and its peers must run builds that
