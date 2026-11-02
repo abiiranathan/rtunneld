@@ -54,7 +54,10 @@ sudo rtunneld peers-list
 
 `rtunnel tui` provides the same device list interactively and launches the local
 `ssh` binary with `ProxyCommand=rtunnel connect <device-id>`. Pass `--user` when
-the remote username differs from the local one.
+the remote username differs from the local one. The TUI requests
+`TERM=xterm-256color` for the remote session so `clear`, colors, and curses
+programs work on hosts that do not know the local terminal type; override it with
+`--remote-term` when the server has matching terminfo.
 
 Change an agent's allowlist without re-enrolling it:
 

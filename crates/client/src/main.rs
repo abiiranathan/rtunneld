@@ -4,8 +4,9 @@
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use crossterm::cursor::{Hide, Show};
-use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind};
+use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
+use crossterm::style::ResetColor;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
@@ -140,6 +141,10 @@ enum Command {
         /// Remote SSH user. Defaults to your local username or the OpenSSH config.
         #[arg(long)]
         user: Option<String>,
+        /// TERM value for the remote SSH session. The local terminal type is not
+        /// forwarded because it is often unknown on the remote host.
+        #[arg(long, default_value = "xterm-256color")]
+        remote_term: String,
     },
     /// Generate OpenSSH host config blocks.
     SshConfig {
@@ -1157,7 +1162,7 @@ impl TerminalGuard {
     fn enter() -> std::io::Result<Self> {
         enable_raw_mode()?;
         let mut stdout = std::io::stdout();
-        if let Err(error) = execute!(stdout, EnterAlternateScreen, Hide) {
+        if let Err(error) = execute!(stdout, ResetColor, EnterAlternateScreen, Hide) {
             let _ = disable_raw_mode();
             return Err(error);
         }
@@ -1170,7 +1175,7 @@ impl Drop for TerminalGuard {
         if let Err(error) = disable_raw_mode() {
             eprintln!("rtunnel: cannot leave raw mode: {error}");
         }
-        if let Err(error) = execute!(std::io::stdout(), LeaveAlternateScreen, Show) {
+        if let Err(error) = execute!(std::io::stdout(), ResetColor, LeaveAlternateScreen, Show) {
             eprintln!("rtunnel: cannot restore the terminal screen: {error}");
         }
     }
@@ -1245,7 +1250,7 @@ fn draw_tui(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
     frame.render_stateful_widget(table, chunks[1], &mut app.table);
 
     let help = format!(
-        "{}\nTarget: {}    Up/Down select  Left/Right target  Enter SSH  r refresh  q quit",
+        "{}\nTarget: {}    Up/Down select  Left/Right target  Enter SSH  r refresh  Ctrl+L clear  q quit",
         app.status,
         app.target_label()
     );
@@ -1287,6 +1292,7 @@ async fn ssh_into_agent(
     agent: &NamedAgent,
     target: Option<&str>,
     user: Option<&str>,
+    remote_term: &str,
 ) -> Result<i32> {
     let executable = std::env::current_exe().context("cannot locate the rtunnel executable")?;
     let executable = executable.to_string_lossy();
@@ -1298,6 +1304,10 @@ async fn ssh_into_agent(
 
     let alias = tui_ssh_alias(agent, target);
     let mut command = tokio::process::Command::new("ssh");
+    // OpenSSH forwards the local TERM to the remote pty. Terminal names such as
+    // `xterm-ghostty` are usually absent from the remote terminfo database, so
+    // force a widely available type while leaving the local TUI untouched.
+    command.env("TERM", remote_term);
     if let Some(user) = user {
         command.arg("-l").arg(user);
     }
@@ -1325,7 +1335,7 @@ async fn refresh_tui(app: &mut TuiApp, state_dir: &Path) {
     }
 }
 
-async fn run_tui(state_dir: &Path, user: Option<String>) -> Result<()> {
+async fn run_tui(state_dir: &Path, user: Option<String>, remote_term: &str) -> Result<()> {
     let agents = fetch_agents(state_dir)
         .await
         .context("cannot load devices for the TUI")?;
@@ -1336,6 +1346,7 @@ async fn run_tui(state_dir: &Path, user: Option<String>) -> Result<()> {
 
     let mut guard = TerminalGuard::enter().context("cannot initialize the terminal")?;
     let mut terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
+    terminal.clear()?;
 
     loop {
         terminal.draw(|frame| draw_tui(frame, &mut app))?;
@@ -1350,12 +1361,30 @@ async fn run_tui(state_dir: &Path, user: Option<String>) -> Result<()> {
                     && key.kind == KeyEventKind::Press
                 {
                     match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => break,
-                        KeyCode::Up | KeyCode::Char('k') => app.select_previous(),
-                        KeyCode::Down | KeyCode::Char('j') => app.select_next(),
-                        KeyCode::Left | KeyCode::Char('h') => app.target_previous(),
-                        KeyCode::Right | KeyCode::Char('l') => app.target_next(),
-                        KeyCode::Char('r') => refresh_tui(&mut app, state_dir).await,
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            break;
+                        }
+                        KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            terminal.clear()?;
+                            app.status = String::from("Screen cleared.");
+                        }
+                        KeyCode::Char('q') if key.modifiers.is_empty() => break,
+                        KeyCode::Esc => break,
+                        KeyCode::Up | KeyCode::Char('k') if key.modifiers.is_empty() => {
+                            app.select_previous();
+                        }
+                        KeyCode::Down | KeyCode::Char('j') if key.modifiers.is_empty() => {
+                            app.select_next();
+                        }
+                        KeyCode::Left | KeyCode::Char('h') if key.modifiers.is_empty() => {
+                            app.target_previous();
+                        }
+                        KeyCode::Right | KeyCode::Char('l') if key.modifiers.is_empty() => {
+                            app.target_next();
+                        }
+                        KeyCode::Char('r') if key.modifiers.is_empty() => {
+                            refresh_tui(&mut app, state_dir).await;
+                        }
                         KeyCode::Enter => {
                             let Some(agent) = app.selected_agent().cloned() else {
                                 continue;
@@ -1368,11 +1397,18 @@ async fn run_tui(state_dir: &Path, user: Option<String>) -> Result<()> {
                             drop(terminal);
                             drop(guard);
 
-                            let result = ssh_into_agent(&agent, target.as_deref(), user.as_deref()).await;
+                            let result = ssh_into_agent(
+                                &agent,
+                                target.as_deref(),
+                                user.as_deref(),
+                                remote_term,
+                            )
+                            .await;
 
                             guard = TerminalGuard::enter()
                                 .context("cannot re-enter the terminal after SSH")?;
                             terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
+                            terminal.clear()?;
                             app.status = match result {
                                 Ok(0) => format!("SSH session to {} closed.", agent.label()),
                                 Ok(code) => format!(
@@ -1722,8 +1758,8 @@ async fn main() -> Result<()> {
         Command::Name { name } => {
             run_name(&state_dir, name).await?;
         }
-        Command::Tui { user } => {
-            run_tui(&state_dir, user).await?;
+        Command::Tui { user, remote_term } => {
+            run_tui(&state_dir, user, &remote_term).await?;
         }
         Command::SshConfig {
             agent,

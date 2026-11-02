@@ -330,13 +330,24 @@ rtunnel tui                     # SSH as your local username
 rtunnel tui --user root         # override the remote user
 ```
 
+The picker requests `TERM=xterm-256color` for the remote session by default.
+Terminal names such as `xterm-ghostty`, `xterm-kitty`, or `wezterm` are often
+absent from a server's terminfo database, which makes `clear`, colors, and
+full-screen programs fail. Override the value only when the remote host has the
+matching terminfo entry:
+
+```bash
+rtunnel tui --remote-term xterm-ghostty
+```
+
 | Key | Action |
 | --- | --- |
 | Up / Down, `k` / `j` | Move between devices |
 | Left / Right, `h` / `l` | Cycle the target for the selected device |
 | Enter | Open SSH to the selection |
 | `r` | Refresh the device list immediately |
-| `q`, Esc | Quit |
+| Ctrl+L | Clear and redraw the screen |
+| Ctrl+C, `q`, Esc | Quit |
 
 The list refreshes from the relay every 5 seconds. You need `ssh` on `PATH`; set
 `--user` when your local username differs from the remote one.
@@ -498,6 +509,11 @@ owners with `rtunnel agents` and `sudo rtunneld peers-list`.
 **`rtunnel tui` cannot start SSH** — the picker launches the local `ssh` binary.
 Confirm OpenSSH is installed and on `PATH`, and pass `rtunnel tui --user <user>`
 if your local and remote usernames differ.
+
+**`'xterm-ghostty': unknown terminal type`** — the remote host lacks terminfo for
+your local terminal. The TUI already requests `xterm-256color` for remote
+sessions; if you connected manually, run `TERM=xterm-256color ssh <host>` or
+install the matching terminfo package on the server.
 
 **Relay handshake fails** — verify the relay address, that UDP `4433` is open,
 and that `rtunnel setup --relay-fingerprint` matches the relay's certificate.
