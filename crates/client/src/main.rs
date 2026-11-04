@@ -195,6 +195,30 @@ fn default_state_dir() -> PathBuf {
     }
 }
 
+/// Returns the local machine name, including Windows' `COMPUTERNAME` fallback.
+fn local_hostname() -> String {
+    ["HOSTNAME", "COMPUTERNAME"]
+        .iter()
+        .find_map(|key| {
+            std::env::var(key)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or_else(|| "node".into())
+}
+
+/// Returns the local user name, including Windows' `USERNAME` fallback.
+fn local_username() -> String {
+    ["USER", "USERNAME"]
+        .iter()
+        .find_map(|key| {
+            std::env::var(key)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or_else(|| "client".into())
+}
+
 fn load_client_state(state_dir: &Path) -> Result<(ClientConfig, KeyMaterial)> {
     let config = ClientConfig::load(state_dir)
         .context("client configuration missing; run 'rtunnel setup' or 'rtunnel enroll' first")?;
@@ -474,9 +498,8 @@ async fn run_setup(
         .ok_or_else(|| anyhow!("failed to capture relay certificate fingerprint"))?;
 
     let (mut send, mut recv) = connection.open_bi().await?;
-    let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "node".into());
     let reg_msg = ControlMessage::RegisterDevice {
-        label: hostname,
+        label: local_hostname(),
         existing_device_id: None,
     };
     write_frame(&mut send, &reg_msg).await?;
@@ -567,9 +590,8 @@ async fn run_host(state_dir: &Path, target: &str) -> Result<()> {
 
     println!("=== rtunnel Host Daemon Running ===");
     println!("Device ID:   {}", format_device_id(&config.client_name));
-    println!("Access Code: {code_str} (valid for 15 minutes)");
     println!("Allowed target: {target}");
-    println!("Ready for inbound connections. Press Ctrl+C to exit.\n");
+    println!("Connecting to relay...\n");
 
     // The tunnel connection serves SSH bytes and advertises the allowlist.
     // AgentRunner owns reconnection, so the host keeps working across restarts.
@@ -628,9 +650,8 @@ async fn run_host_rendezvous(
     // for pairing prompts. Setup registered the identity earlier, so the relay
     // returns the same Device ID for the existing fingerprint.
     let (mut reg_send, mut reg_recv) = connection.open_bi().await?;
-    let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "node".into());
     let reg_msg = ControlMessage::RegisterDevice {
-        label: hostname,
+        label: local_hostname(),
         existing_device_id: Some(config.client_name.clone()),
     };
     write_frame(&mut reg_send, &reg_msg).await?;
@@ -658,9 +679,12 @@ async fn run_host_rendezvous(
         }
     }
 
-    // Publish the one-time access code (the relay stores only its hash).
+    // Publish the one-time access code (the relay stores only its hash). Only
+    // print the code after this succeeds so the operator never copies a code
+    // the relay has not received yet.
     publish_pairing_code(&connection, code_hash).await?;
     println!("Host online. Access Code: {code_str} (valid for 15 minutes)");
+    println!("Ready for inbound connections. Press Ctrl+C to exit.\n");
 
     // Refresh the code before the relay's TTL expires so an idle host always
     // has a usable code to show.
@@ -733,6 +757,7 @@ async fn publish_pairing_code(connection: &Connection, code_hash: &str) -> Resul
         ttl_secs: PAIRING_CODE_TTL_SECS,
     };
     write_frame(&mut send, &set_code).await?;
+    let _ = send.finish();
     Ok(())
 }
 
@@ -844,7 +869,7 @@ async fn run_connect(
         let pair_req = ControlMessage::PairRequest {
             target_device_id: target.clone(),
             code,
-            client_label: std::env::var("USER").unwrap_or_else(|_| "client".into()),
+            client_label: local_username(),
             ssh_pubkey: None,
         };
         write_frame(&mut p_send, &pair_req).await?;
@@ -869,10 +894,21 @@ async fn run_connect(
                     error,
                     ..
                 } => {
-                    bail!(
-                        "Pairing failed: {:?}",
-                        error.unwrap_or(ErrorCode::Unauthorized)
-                    );
+                    let error = error.unwrap_or(ErrorCode::Unauthorized);
+                    let hint = match error {
+                        ErrorCode::AgentOffline => {
+                            " (the host is not online yet; wait for 'Host online' on the host)"
+                        }
+                        ErrorCode::InvalidPairingCode => {
+                            " (the code was already used or expired; use the latest Access Code shown on the host)"
+                        }
+                        ErrorCode::DeviceNotFound => {
+                            " (no device has that Device ID or canonical name)"
+                        }
+                        ErrorCode::PairingDenied => " (the host operator denied the request)",
+                        _ => "",
+                    };
+                    bail!("Pairing failed: {error}{hint}");
                 }
                 other => bail!("unexpected relay response during pairing: {other:?}"),
             }
@@ -1276,6 +1312,24 @@ fn shell_quote(value: &str) -> String {
     }
 }
 
+/// Returns the executable prefix used by generated `ProxyCommand` lines.
+///
+/// The executable is always absolute so Windows works even when the install
+/// directory is not yet on the `PATH` inherited by OpenSSH. A non-default state
+/// directory is forwarded to the child process as well.
+fn proxy_command_prefix(state_dir: &Path) -> String {
+    let executable = std::env::current_exe().map_or_else(
+        |_| rtunnel_install::executable_name("rtunnel"),
+        |path| path.to_string_lossy().into_owned(),
+    );
+    let mut prefix = shell_quote(&executable);
+    if state_dir != default_state_dir() {
+        prefix.push_str(" --state-dir ");
+        prefix.push_str(&shell_quote(&state_dir.to_string_lossy()));
+    }
+    prefix
+}
+
 /// Chooses the OpenSSH host alias shown in `known_hosts` for a TUI selection.
 fn tui_ssh_alias(agent: &NamedAgent, target: Option<&str>) -> String {
     let label = agent.label().to_owned();
@@ -1289,14 +1343,13 @@ fn tui_ssh_alias(agent: &NamedAgent, target: Option<&str>) -> String {
 /// Suspends the TUI, runs OpenSSH with this binary as its `ProxyCommand`, and
 /// returns the SSH exit code.
 async fn ssh_into_agent(
+    state_dir: &Path,
     agent: &NamedAgent,
     target: Option<&str>,
     user: Option<&str>,
     remote_term: &str,
 ) -> Result<i32> {
-    let executable = std::env::current_exe().context("cannot locate the rtunnel executable")?;
-    let executable = executable.to_string_lossy();
-    let mut proxy = format!("{} connect {}", shell_quote(&executable), agent.name);
+    let mut proxy = format!("{} connect {}", proxy_command_prefix(state_dir), agent.name);
     if let Some(target) = target {
         proxy.push(' ');
         proxy.push_str(&shell_quote(target));
@@ -1398,6 +1451,7 @@ async fn run_tui(state_dir: &Path, user: Option<String>, remote_term: &str) -> R
                             drop(guard);
 
                             let result = ssh_into_agent(
+                                state_dir,
                                 &agent,
                                 target.as_deref(),
                                 user.as_deref(),
@@ -1476,7 +1530,7 @@ async fn print_ssh_config(state_dir: &Path, agent: &str, target: Option<&str>) -
         ssh_hosts(&device_id, &label, &targets)
     };
 
-    print!("{}", render_snippets(&hosts));
+    print!("{}", render_snippets(&hosts, state_dir));
     Ok(())
 }
 
@@ -1548,7 +1602,7 @@ async fn write_ssh_config(
     }
 
     for (name, hosts) in planned {
-        let path = write_agent_snippet(&snippets, &name, &hosts)?;
+        let path = write_agent_snippet(&snippets, &name, &hosts, state_dir)?;
         println!("Wrote {}", path.display());
     }
     Ok(())
@@ -1561,9 +1615,9 @@ struct SshHost {
     target: Option<String>,
 }
 
-fn ssh_config_snippet(host_alias: &str, agent: &str, target: Option<&str>) -> String {
+fn ssh_config_snippet(host_alias: &str, agent: &str, target: Option<&str>, proxy: &str) -> String {
     let target_suffix = target.map_or(String::new(), |dest| format!(" {dest}"));
-    format!("Host {host_alias}\n    ProxyCommand rtunnel connect {agent}{target_suffix}\n")
+    format!("Host {host_alias}\n    ProxyCommand {proxy} connect {agent}{target_suffix}\n")
 }
 
 fn target_alias(label: &str, target: &str, used: &mut BTreeSet<String>) -> Option<String> {
@@ -1618,19 +1672,25 @@ fn ssh_hosts(device_id: &str, label: &str, targets: &[String]) -> Vec<SshHost> {
     hosts
 }
 
-fn render_snippets(hosts: &[SshHost]) -> String {
+fn render_snippets(hosts: &[SshHost], state_dir: &Path) -> String {
+    let proxy = proxy_command_prefix(state_dir);
     hosts
         .iter()
-        .map(|host| ssh_config_snippet(&host.alias, &host.agent, host.target.as_deref()))
+        .map(|host| ssh_config_snippet(&host.alias, &host.agent, host.target.as_deref(), &proxy))
         .collect()
 }
 
-fn write_agent_snippet(snippets: &Path, agent: &str, hosts: &[SshHost]) -> Result<PathBuf> {
+fn write_agent_snippet(
+    snippets: &Path,
+    agent: &str,
+    hosts: &[SshHost],
+    state_dir: &Path,
+) -> Result<PathBuf> {
     if !is_valid_name(agent) {
         bail!("refusing to write a snippet for invalid agent name '{agent}'");
     }
     let path = snippets.join(format!("{agent}.conf"));
-    std::fs::write(&path, render_snippets(hosts))
+    std::fs::write(&path, render_snippets(hosts, state_dir))
         .with_context(|| format!("failed to write {}", path.display()))?;
     Ok(path)
 }
@@ -1656,6 +1716,7 @@ async fn write_all_ssh_configs(state_dir: &Path) -> Result<Vec<String>> {
             &snippets,
             &label,
             &ssh_hosts(&agent.name, &label, &agent.targets),
+            state_dir,
         )?;
         written.push(label);
     }
@@ -1779,4 +1840,23 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SshHost, render_snippets};
+
+    #[test]
+    fn snippets_use_an_absolute_proxy_executable() {
+        let hosts = [SshHost {
+            alias: "office-pc".into(),
+            agent: "123456789".into(),
+            target: None,
+        }];
+        let rendered = render_snippets(&hosts, std::path::Path::new("rtunnel-test-state"));
+
+        assert!(!rendered.contains("ProxyCommand rtunnel connect"));
+        assert!(rendered.contains("connect 123456789\n"));
+        assert!(rendered.contains("--state-dir rtunnel-test-state"));
+    }
 }

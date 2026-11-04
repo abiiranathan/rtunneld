@@ -278,5 +278,12 @@ async fn handle_target_stream(
 }
 
 fn gethostname() -> String {
-    std::env::var("HOSTNAME").unwrap_or_else(|_| "localhost".into())
+    ["HOSTNAME", "COMPUTERNAME"]
+        .iter()
+        .find_map(|key| {
+            std::env::var(key)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or_else(|| "localhost".into())
 }

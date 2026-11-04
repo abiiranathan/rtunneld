@@ -95,7 +95,9 @@ powershell -ExecutionPolicy Bypass -File $installer `
 append the install directory to the **user** `PATH` (`HKCU\Environment`), and
 broadcast `WM_SETTINGCHANGE` so new terminals see it. It also writes an absolute
 `Include` line for `%USERPROFILE%\.ssh\rtunnel.d\*`; Windows OpenSSH does not
-reliably expand `~`. Open a new terminal after the installer finishes.
+reliably expand `~`. Generated host entries use the absolute `rtunnel.exe` path
+as their `ProxyCommand`, so they also work in terminals that have not picked up
+the new `PATH` yet. Open a new terminal after the installer finishes.
 
 The Windows client requires the optional OpenSSH Client feature (Settings > Apps
 > Optional Features). Verify with:

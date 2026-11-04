@@ -203,12 +203,16 @@ It prints the Device ID and a single-use access code:
 ```text
 === rtunnel Host Daemon Running ===
 Device ID:   482 913 077
-Access Code: 834 291 (valid for 15 minutes)
 Allowed target: 127.0.0.1:22
+Connecting to relay...
+
+Host online. Access Code: 834 291 (valid for 15 minutes)
 ```
 
-The relay consumes the code on first use. The host prints a replacement after
-every pairing attempt, so always use the latest `Access Code:` line.
+Wait for the `Host online` line before using the code; the relay only knows the
+code after that point. The relay consumes the code on first use. The host prints
+a replacement after every pairing attempt, so always use the latest
+`Access Code:` line.
 
 From the workstation, connect through OpenSSH with `rtunnel connect` as the
 `ProxyCommand`:

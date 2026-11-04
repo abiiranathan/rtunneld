@@ -28,18 +28,21 @@ pub const SYSTEMD_STATE_ROOT: &str = "/var/lib";
 const SSH_INCLUDE_LINE: &str = "Include ~/.ssh/rtunnel.d/*";
 
 /// Returns `true` if the current process has effective UID 0.
+#[cfg(unix)]
 #[must_use]
 pub fn is_root() -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::MetadataExt;
 
-        fs::metadata("/proc/self").is_ok_and(|metadata| metadata.uid() == 0)
-    }
-    #[cfg(not(unix))]
-    {
-        false
-    }
+    fs::metadata("/proc/self").is_ok_and(|metadata| metadata.uid() == 0)
+}
+
+/// Returns `true` if the current process has effective UID 0.
+///
+/// Windows has no Unix UID, so this is always `false`.
+#[cfg(not(unix))]
+#[must_use]
+pub const fn is_root() -> bool {
+    false
 }
 
 /// Returns an error unless the process runs as root or administrator.
@@ -187,6 +190,96 @@ fn encode_reg_string(text: &str) -> Vec<u8> {
     let mut bytes: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
     bytes.extend_from_slice(&[0, 0]);
     bytes
+}
+
+/// Quotes one Windows command-line component using the standard `CommandLineToArgvW` rules.
+///
+/// The result preserves spaces, quotes, and trailing backslashes when it is
+/// embedded inside a larger command line such as an `sc.exe` `binPath=` value.
+#[cfg(any(windows, test))]
+fn quote_windows_component(value: &str) -> String {
+    if !value.is_empty()
+        && !value
+            .chars()
+            .any(|character| character.is_whitespace() || character == '"')
+    {
+        return value.to_owned();
+    }
+
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    let mut backslashes = 0_usize;
+    for character in value.chars() {
+        match character {
+            '\\' => backslashes += 1,
+            '"' => {
+                quoted.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+                quoted.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                quoted.extend(std::iter::repeat_n('\\', backslashes));
+                quoted.push(character);
+                backslashes = 0;
+            }
+        }
+    }
+    quoted.extend(std::iter::repeat_n('\\', backslashes * 2));
+    quoted.push('"');
+    quoted
+}
+
+/// Builds the `binPath=` value stored by the Windows Service Control Manager.
+///
+/// The executable path is quoted independently from its arguments so a service
+/// installed under a directory containing spaces still starts.
+#[cfg(any(windows, test))]
+fn windows_service_bin_path(bin_path: &Path, args: &[&str]) -> String {
+    let mut command = quote_windows_component(&bin_path.to_string_lossy());
+    for arg in args {
+        command.push(' ');
+        command.push_str(&quote_windows_component(arg));
+    }
+    command
+}
+
+/// Builds the full `sc.exe create` argument list for the host service.
+///
+/// `sc.exe` requires a space between each `key=` and its value, but Rust's
+/// `Command` quotes arguments that contain spaces. Passing `"start= auto"` as a
+/// single argument therefore reaches `sc.exe` as one quoted token and fails with
+/// `Invalid start= field`; the key and value must be separate arguments.
+#[cfg(any(windows, test))]
+fn sc_create_args(service_name: &str, bin_path: &Path, args: &[&str]) -> Vec<String> {
+    vec![
+        "create".to_owned(),
+        service_name.to_owned(),
+        "binPath=".to_owned(),
+        windows_service_bin_path(bin_path, args),
+        "start=".to_owned(),
+        "auto".to_owned(),
+    ]
+}
+
+/// Runs `sc.exe` and turns a non-zero exit into an error with the manager's output.
+#[cfg(windows)]
+fn run_sc(args: &[&str]) -> io::Result<()> {
+    let output = Command::new("sc.exe").args(args).output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let detail = if stderr.trim().is_empty() {
+        stdout.trim()
+    } else {
+        stderr.trim()
+    };
+    Err(io::Error::other(format!(
+        "sc.exe {} failed: {detail}",
+        args.first().copied().unwrap_or("command")
+    )))
 }
 
 /// Creates `path` and applies mode `0700` on Unix.
@@ -349,24 +442,10 @@ pub fn install_service(
 
     #[cfg(windows)]
     {
-        let bin_args = format!("{} {}", bin_path.display(), args.join(" "));
-        let status = Command::new("sc.exe")
-            .args([
-                "create",
-                service_name,
-                &format!("binPath= {bin_args}"),
-                "start= auto",
-            ])
-            .status()?;
-        if !status.success() {
-            return Err(io::Error::other("sc.exe create service failed"));
-        }
-        let start_status = Command::new("sc.exe")
-            .args(["start", service_name])
-            .status()?;
-        if !start_status.success() {
-            return Err(io::Error::other("sc.exe start service failed"));
-        }
+        let create_args = sc_create_args(service_name, bin_path, args);
+        let create_refs: Vec<&str> = create_args.iter().map(String::as_str).collect();
+        run_sc(&create_refs)?;
+        run_sc(&["start", service_name])?;
         Ok(())
     }
 
@@ -409,14 +488,7 @@ pub fn start_service(service_name: &str) -> io::Result<()> {
 
     #[cfg(windows)]
     {
-        let status = Command::new("sc.exe")
-            .args(["start", service_name])
-            .status()?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(io::Error::other("sc.exe start service failed"))
-        }
+        run_sc(&["start", service_name])
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
@@ -458,14 +530,7 @@ pub fn stop_service(service_name: &str) -> io::Result<()> {
 
     #[cfg(windows)]
     {
-        let status = Command::new("sc.exe")
-            .args(["stop", service_name])
-            .status()?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(io::Error::other("sc.exe stop service failed"))
-        }
+        run_sc(&["stop", service_name])
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
@@ -779,7 +844,7 @@ fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
     clippy::unnecessary_wraps,
     reason = "keeps the signature identical to the Unix implementation used in `?` chains"
 )]
-fn set_mode(_path: &Path, _mode: u32) -> io::Result<()> {
+const fn set_mode(_path: &Path, _mode: u32) -> io::Result<()> {
     Ok(())
 }
 
@@ -787,7 +852,7 @@ fn set_mode(_path: &Path, _mode: u32) -> io::Result<()> {
 mod tests {
     use super::{
         append_authorized_key, configure_ssh_include, executable_name, install_self, path_contains,
-        render_unit, ssh_include_line,
+        render_unit, sc_create_args, ssh_include_line,
     };
     use std::ffi::OsStr;
     use std::fs;
@@ -881,6 +946,31 @@ mod tests {
         assert_eq!(
             executable_name("rtunnel"),
             format!("rtunnel{}", super::EXE_SUFFIX)
+        );
+    }
+
+    #[test]
+    fn windows_service_create_separates_option_values() {
+        let args = sc_create_args(
+            "rtunnel",
+            Path::new(r"C:\Program Files\rtunnel\rtunnel.exe"),
+            &[
+                "host",
+                "--state-dir",
+                r"C:\Users\Alice Smith\AppData\Roaming\rtunnel",
+            ],
+        );
+
+        assert_eq!(args[0], "create");
+        assert_eq!(args[2], "binPath=");
+        assert_eq!(args[4], "start=");
+        assert_eq!(args[5], "auto");
+        assert!(!args.iter().any(|arg| arg == "start= auto"));
+        assert!(args[3].contains(r#""C:\Program Files\rtunnel\rtunnel.exe""#));
+        assert!(
+            args[3].contains(r#""C:\Users\Alice Smith\AppData\Roaming\rtunnel""#),
+            "{}",
+            args[3]
         );
     }
 
