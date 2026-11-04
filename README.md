@@ -12,6 +12,9 @@ between your OpenSSH client and the host's `sshd`.
 - Browse devices and open SSH from the built-in `rtunnel tui`.
 - Run the host as a service so it reconnects after a reboot.
 
+Windows users can jump to [Windows setup](#windows-setup-powershell) for the
+complete PowerShell walkthrough.
+
 ## How it works
 
 ```mermaid
@@ -153,11 +156,94 @@ curl -fsSL https://raw.githubusercontent.com/abiiranathan/rtunneld/main/scripts/
 When run as root the binary goes to `/usr/local/bin`; for a normal user it goes
 to `~/.local/bin`. Restart your shell if the command is not found.
 
-On Windows, run `scripts/install.ps1` from a checkout:
+### Windows setup (PowerShell)
 
-```powershell
-.\scripts\install.ps1
-```
+The relay and agent are Linux-only. `rtunnel.exe` runs on Windows as a host, a
+workstation, or both.
+
+1. **Check OpenSSH.** The Windows client uses your existing `ssh.exe`:
+
+   ```powershell
+   ssh -V
+   ```
+
+   If the Windows machine will act as a host, also enable **OpenSSH Server**
+   under **Settings → Apps → Optional Features**, then start it from an elevated
+   PowerShell:
+
+   ```powershell
+   Start-Service sshd
+   Set-Service -Name sshd -StartupType Automatic
+   ```
+
+2. **Install rtunnel.** This downloads the latest release, verifies its
+   checksum, installs `rtunnel.exe` under `%LOCALAPPDATA%\Programs\rtunnel`,
+   adds that directory to your user `PATH`, and configures the OpenSSH include:
+
+   ```powershell
+   $installer = Join-Path $env:TEMP "install-rtunnel.ps1"
+   Invoke-WebRequest -UseBasicParsing `
+     https://raw.githubusercontent.com/abiiranathan/rtunneld/main/scripts/install.ps1 `
+     -OutFile $installer
+   powershell -ExecutionPolicy Bypass -File $installer
+   ```
+
+   Open a new PowerShell window afterward so it picks up the updated `PATH`.
+
+3. **Run setup once on each Windows machine.** Use the same relay address on the
+   host and the workstation, but give each machine its own canonical name. For
+   example, on the Windows host:
+
+   ```powershell
+   rtunnel.exe setup --relay-host relay.example.com --name office-pc
+   ```
+
+   Add `--relay-port <port>` when the relay is not on `4433`, and
+   `--relay-fingerprint <sha256>` to pin the relay certificate explicitly.
+
+4. **Pair from the workstation.** Start `rtunnel.exe host` on the Windows host,
+   then use the access code it prints:
+
+   ```powershell
+   ssh -o "ProxyCommand=rtunnel.exe connect 482913077 --code 834291" <user>@482913077
+   ```
+
+   Approve the request on the host with **Always Allow**.
+
+5. **Write the OpenSSH host entry.** After the device is granted:
+
+   ```powershell
+   rtunnel.exe ssh-config office-pc --write
+   ssh <user>@office-pc
+   ```
+
+   `rtunnel.exe ssh-config --all --write` refreshes entries for every device
+   granted to this workstation. The generated `ProxyCommand` uses the absolute
+   `rtunnel.exe` path, so it also works in shells that have not picked up the new
+   `PATH`.
+
+6. **Run a Windows host as a service.** Pair the client first, because the
+   service has no interactive console and cannot answer pairing prompts. From a
+   new **elevated** PowerShell on the host:
+
+   ```powershell
+   rtunnel.exe --state-dir "$env:APPDATA\rtunnel" service install
+   Get-Service rtunnel
+   ```
+
+   The service starts automatically and survives reboots. Control it with:
+
+   ```powershell
+   rtunnel.exe service start
+   rtunnel.exe service stop
+   Get-Content "$env:APPDATA\rtunnel\service.log" -Tail 50 -Wait
+   ```
+
+   `service install` also updates an existing service registration from older
+   releases. Because Windows services have no console, host output and errors are
+   written to `%APPDATA%\rtunnel\service.log`. If the elevated shell cannot find
+   `rtunnel.exe`, invoke the installed binary directly:
+   `& "$env:LOCALAPPDATA\Programs\rtunnel\rtunnel.exe" ...`
 
 ---
 
@@ -280,18 +366,19 @@ so normal operation is quiet and errors still reach the journal:
 sudo journalctl -u rtunnel.service -f
 ```
 
-On Windows, install and control the service from an elevated PowerShell:
+On Windows, use the sequence in [Windows setup](#windows-setup-powershell).
+Install the service from an elevated PowerShell; host output goes to
+`%APPDATA%\rtunnel\service.log`:
 
 ```powershell
 rtunnel.exe --state-dir "$env:APPDATA\rtunnel" service install
-rtunnel.exe service start
-rtunnel.exe service stop
+Get-Service rtunnel
+Get-Content "$env:APPDATA\rtunnel\service.log" -Tail 50 -Wait
 ```
 
 `service install` uses the native Windows Service Control Manager entry point
 (`rtunnel service run`) and updates an existing registration created by older
-releases. Because a Windows service has no console, host output is written to
-`%APPDATA%\rtunnel\service.log`.
+releases.
 
 A service has no interactive terminal and cannot answer new pairing prompts. To
 add another device, stop the service, pair in the foreground, then start it
@@ -303,6 +390,9 @@ rtunnel host
 # approve the new device with "Always Allow", then press Ctrl+C
 sudo "$(command -v rtunnel)" service start
 ```
+
+On Windows, use the same sequence with `rtunnel.exe service stop`,
+`rtunnel.exe host`, and `rtunnel.exe service start`.
 
 On macOS the default state directory is
 `$HOME/Library/Application Support/com.rtunnel.rtunnel`; on Windows it is
