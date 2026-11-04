@@ -39,9 +39,12 @@ use std::collections::BTreeSet;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::net::lookup_host;
 use tracing_subscriber::EnvFilter;
+
+#[cfg(windows)]
+mod win_service;
 
 const BIND_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
 const EXIT_FAILURE: i32 = 1;
@@ -52,6 +55,93 @@ const DEFAULT_RELAY_PORT: u16 = 4433;
 
 /// Lifetime of the host's ephemeral pairing code.
 const PAIRING_CODE_TTL_SECS: u32 = 900;
+
+/// Service-mode host output destination.
+///
+/// Windows services have no console, so `rtunnel service run` redirects host
+/// output to `<state_dir>/service.log` instead of printing to invalid handles.
+static HOST_LOG: OnceLock<Mutex<Option<std::io::BufWriter<std::fs::File>>>> = OnceLock::new();
+
+fn write_host_line(args: std::fmt::Arguments<'_>) {
+    if let Some(log) = HOST_LOG.get() {
+        if let Ok(mut log) = log.lock()
+            && let Some(file) = log.as_mut()
+        {
+            let _ = writeln!(file, "{args}");
+            let _ = file.flush();
+        }
+        return;
+    }
+    println!("{args}");
+}
+
+fn write_host_prompt(args: std::fmt::Arguments<'_>) {
+    if let Some(log) = HOST_LOG.get() {
+        if let Ok(mut log) = log.lock()
+            && let Some(file) = log.as_mut()
+        {
+            let _ = write!(file, "{args}");
+            let _ = file.flush();
+        }
+        return;
+    }
+    print!("{args}");
+    let _ = std::io::stdout().flush();
+}
+
+fn write_host_warning(args: std::fmt::Arguments<'_>) {
+    if let Some(log) = HOST_LOG.get() {
+        if let Ok(mut log) = log.lock()
+            && let Some(file) = log.as_mut()
+        {
+            let _ = writeln!(file, "{args}");
+            let _ = file.flush();
+        }
+        return;
+    }
+    eprintln!("{args}");
+}
+
+macro_rules! host_line {
+    () => {
+        write_host_line(format_args!(""))
+    };
+    ($($arg:tt)*) => {
+        write_host_line(format_args!($($arg)*))
+    };
+}
+
+macro_rules! host_prompt {
+    ($($arg:tt)*) => {
+        write_host_prompt(format_args!($($arg)*))
+    };
+}
+
+macro_rules! host_warn {
+    ($($arg:tt)*) => {
+        write_host_warning(format_args!($($arg)*))
+    };
+}
+
+#[cfg(windows)]
+fn initialize_service_log(state_dir: &Path) {
+    let _ = std::fs::create_dir_all(state_dir);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(state_dir.join("service.log"))
+        .ok()
+        .map(std::io::BufWriter::new);
+    let _ = HOST_LOG.set(Mutex::new(file));
+}
+
+/// Returns true when host output is redirected to a service log.
+///
+/// A Windows service has no usable console, so interactive pairing prompts are
+/// declined automatically instead of blocking on invalid stdin handles.
+fn service_output_active() -> bool {
+    HOST_LOG.get().is_some()
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -171,6 +261,13 @@ enum ServiceCommand {
     Start,
     /// Stop host service.
     Stop,
+    /// Internal entry point used by the Windows Service Control Manager.
+    #[command(hide = true)]
+    Run {
+        /// Local destination that inbound sessions may dial.
+        #[arg(long, default_value = "127.0.0.1:22")]
+        target: String,
+    },
 }
 
 fn resolve_state_dir(override_dir: Option<PathBuf>) -> PathBuf {
@@ -588,10 +685,11 @@ async fn run_host(state_dir: &Path, target: &str) -> Result<()> {
     // code as soon as it verifies one.
     let (mut code_str, mut code_hash) = generate_pairing_code();
 
-    println!("=== rtunnel Host Daemon Running ===");
-    println!("Device ID:   {}", format_device_id(&config.client_name));
-    println!("Allowed target: {target}");
-    println!("Connecting to relay...\n");
+    host_line!("=== rtunnel Host Daemon Running ===");
+    host_line!("Device ID:   {}", format_device_id(&config.client_name));
+    host_line!("Allowed target: {target}");
+    host_line!("Connecting to relay...");
+    host_line!();
 
     // The tunnel connection serves SSH bytes and advertises the allowlist.
     // AgentRunner owns reconnection, so the host keeps working across restarts.
@@ -606,7 +704,7 @@ async fn run_host(state_dir: &Path, target: &str) -> Result<()> {
     let agent_id = id.clone();
     tokio::spawn(async move {
         if let Err(e) = AgentRunner::new(agent_config, agent_id).run().await {
-            eprintln!("rtunnel: host tunnel stopped: {e}");
+            host_warn!("rtunnel: host tunnel stopped: {e}");
         }
     });
 
@@ -614,8 +712,8 @@ async fn run_host(state_dir: &Path, target: &str) -> Result<()> {
     loop {
         match run_host_rendezvous(state_dir, &mut config, &id, &mut code_hash, &mut code_str).await
         {
-            Ok(()) => eprintln!("rtunnel: relay closed the host rendezvous connection"),
-            Err(e) => eprintln!("rtunnel: host rendezvous connection failed: {e:#}"),
+            Ok(()) => host_warn!("rtunnel: relay closed the host rendezvous connection"),
+            Err(e) => host_warn!("rtunnel: host rendezvous connection failed: {e:#}"),
         }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(std::time::Duration::from_secs(30));
@@ -663,7 +761,7 @@ async fn run_host_rendezvous(
         _ => bail!("unexpected relay response to host registration"),
     };
     if device_id != config.client_name {
-        println!(
+        host_line!(
             "Relay assigned Device ID {}; updating local configuration.",
             format_device_id(&device_id)
         );
@@ -673,9 +771,9 @@ async fn run_host_rendezvous(
 
     if let Some(name) = config.display_name.clone() {
         if let Err(error) = set_display_name_on_relay(&connection, &name).await {
-            eprintln!("rtunnel: warning: {error:#}");
+            host_warn!("rtunnel: warning: {error:#}");
         } else {
-            println!("Canonical name: {name}");
+            host_line!("Canonical name: {name}");
         }
     }
 
@@ -683,8 +781,9 @@ async fn run_host_rendezvous(
     // print the code after this succeeds so the operator never copies a code
     // the relay has not received yet.
     publish_pairing_code(&connection, code_hash).await?;
-    println!("Host online. Access Code: {code_str} (valid for 15 minutes)");
-    println!("Ready for inbound connections. Press Ctrl+C to exit.\n");
+    host_line!("Host online. Access Code: {code_str} (valid for 15 minutes)");
+    host_line!("Ready for inbound connections. Press Ctrl+C to exit.");
+    host_line!();
 
     // Refresh the code before the relay's TTL expires so an idle host always
     // has a usable code to show.
@@ -725,7 +824,7 @@ async fn run_host_rendezvous(
                     )
                     .await
                     {
-                        eprintln!("rtunnel: failed to answer pairing prompt: {e:#}");
+                        host_warn!("rtunnel: failed to answer pairing prompt: {e:#}");
                     }
 
                     // The relay consumes the code while verifying it, even if
@@ -771,7 +870,7 @@ async fn rotate_pairing_code(
     publish_pairing_code(connection, &new_hash).await?;
     *code_hash = new_hash;
     *code_str = new_code;
-    println!("New Access Code: {code_str} (valid for 15 minutes)");
+    host_line!("New Access Code: {code_str} (valid for 15 minutes)");
     Ok(())
 }
 
@@ -784,29 +883,36 @@ async fn handle_pair_prompt(
     sas: &str,
     ssh_pubkey: Option<String>,
 ) -> Result<()> {
-    println!("--------------------------------------------------");
-    println!("INCOMING PAIRING REQUEST");
-    println!(
+    host_line!("--------------------------------------------------");
+    host_line!("INCOMING PAIRING REQUEST");
+    host_line!(
         "Connecting Device: {} ({})",
         client_label,
         format_device_id(client_id)
     );
-    println!("Authentication Code (SAS): [{sas}]");
-    println!("Verify this code matches the one on the connecting device.");
+    host_line!("Authentication Code (SAS): [{sas}]");
+    host_line!("Verify this code matches the one on the connecting device.");
     if ssh_pubkey.is_some() {
-        println!("Client requested SSH Public Key authorization.");
+        host_line!("Client requested SSH Public Key authorization.");
     }
-    println!("--------------------------------------------------");
-    print!("Authorize this device? [1] Allow Once, [2] Always Allow, [3] Deny: ");
-    let _ = std::io::stdout().flush();
+    host_line!("--------------------------------------------------");
 
-    let input = tokio::task::spawn_blocking(|| {
-        let mut line = String::new();
-        std::io::stdin().read_line(&mut line).map(|_| line)
-    })
-    .await
-    .context("pairing prompt task failed")?
-    .context("cannot read pairing decision from stdin")?;
+    let input = if service_output_active() {
+        host_warn!(
+            "rtunnel: denying pairing request automatically because the service has no interactive console."
+        );
+        host_warn!("Pair interactively first and choose \"Always Allow\".");
+        String::from("3")
+    } else {
+        host_prompt!("Authorize this device? [1] Allow Once, [2] Always Allow, [3] Deny: ");
+        tokio::task::spawn_blocking(|| {
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line).map(|_| line)
+        })
+        .await
+        .context("pairing prompt task failed")?
+        .context("cannot read pairing decision from stdin")?
+    };
     let choice = input.trim();
 
     let (approved, duration) = match choice {
@@ -821,7 +927,7 @@ async fn handle_pair_prompt(
         && let Some(dirs) = BaseDirs::new()
     {
         let _ = rtunnel_install::append_authorized_key(dirs.home_dir(), key);
-        println!("Added client SSH key to ~/.ssh/authorized_keys");
+        host_line!("Added client SSH key to ~/.ssh/authorized_keys");
     }
 
     let resp = ControlMessage::PairPromptResponse {
@@ -832,9 +938,9 @@ async fn handle_pair_prompt(
     };
     write_frame(&mut stream_send, &resp).await?;
     if approved {
-        println!("Authorized successfully.");
+        host_line!("Authorized successfully.");
     } else {
-        println!("Connection request denied.");
+        host_line!("Connection request denied.");
     }
     Ok(())
 }
@@ -1723,6 +1829,37 @@ async fn write_all_ssh_configs(state_dir: &Path) -> Result<Vec<String>> {
     Ok(written)
 }
 
+/// Dispatches the `rtunnel service` subcommands.
+fn run_service_command(action: ServiceCommand, state_dir: &Path) -> Result<()> {
+    match action {
+        ServiceCommand::Install {
+            relay_host: _,
+            target,
+        } => install_host_service(state_dir, &target),
+        ServiceCommand::Start => {
+            rtunnel_install::start_service("rtunnel")?;
+            println!("rtunnel service started.");
+            Ok(())
+        }
+        ServiceCommand::Stop => {
+            rtunnel_install::stop_service("rtunnel")?;
+            println!("rtunnel service stopped.");
+            Ok(())
+        }
+        ServiceCommand::Run { target } => {
+            #[cfg(windows)]
+            {
+                win_service::run(state_dir, &target)
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = target;
+                bail!("`service run` is only supported on Windows");
+            }
+        }
+    }
+}
+
 /// Installs `rtunnel host` as a platform background service.
 fn install_host_service(state_dir: &Path, target: &str) -> Result<()> {
     let bin = std::env::current_exe()?;
@@ -1730,12 +1867,19 @@ fn install_host_service(state_dir: &Path, target: &str) -> Result<()> {
     let target = HostPort::parse(target)
         .map_err(|_| anyhow!("invalid host target; expected host:port"))?
         .to_string();
-    rtunnel_install::install_service(
-        "rtunnel",
-        &bin,
-        &["host", "--state-dir", &state_dir_arg, "--target", &target],
-        state_dir,
-    )?;
+    #[cfg(windows)]
+    let service_args = vec![
+        "--state-dir",
+        &state_dir_arg,
+        "service",
+        "run",
+        "--target",
+        &target,
+    ];
+    #[cfg(not(windows))]
+    let service_args = vec!["host", "--state-dir", &state_dir_arg, "--target", &target];
+
+    rtunnel_install::install_service("rtunnel", &bin, &service_args, state_dir)?;
     println!("rtunnel background service installed and started.");
     Ok(())
 }
@@ -1779,20 +1923,7 @@ async fn main() -> Result<()> {
         Command::Host { target } => {
             run_host(&state_dir, &target).await?;
         }
-        Command::Service { action } => match action {
-            ServiceCommand::Install {
-                relay_host: _,
-                target,
-            } => install_host_service(&state_dir, &target)?,
-            ServiceCommand::Start => {
-                rtunnel_install::start_service("rtunnel")?;
-                println!("rtunnel service started.");
-            }
-            ServiceCommand::Stop => {
-                rtunnel_install::stop_service("rtunnel")?;
-                println!("rtunnel service stopped.");
-            }
-        },
+        Command::Service { action } => run_service_command(action, &state_dir)?,
         Command::Install {
             uri,
             bin_dir,

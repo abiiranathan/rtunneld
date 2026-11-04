@@ -109,11 +109,25 @@ rtunnel.exe ssh-config --all --write
 ssh user@<agent>
 ```
 
+To keep the host online after logout, install the background service from an
+elevated PowerShell:
+
+```powershell
+rtunnel.exe --state-dir "$env:APPDATA\rtunnel" service install
+rtunnel.exe service start
+rtunnel.exe service stop
+```
+
+The service uses a hidden `rtunnel service run` entry point and logs host output
+to `%APPDATA%\rtunnel\service.log` because Windows services have no console.
+Re-running `service install` updates an existing service registration instead of
+failing when the service already exists.
+
 ## File Paths
 - Relay State: `/var/lib/rtunnel` (`identity.key`, `identity.crt`, `rtunnel.db`, `audit.log`)
 - Agent State: `/var/lib/rtunnel-agent` (`identity.key`, `identity.crt`, `config.toml`)
 - Client State (Unix): `~/.config/rtunnel` (`identity.key`, `identity.crt`, `config.toml`)
-- Client State (Windows): `%APPDATA%\rtunnel` (`identity.key`, `identity.crt`, `config.toml`)
+- Client State (Windows): `%APPDATA%\rtunnel` (`identity.key`, `identity.crt`, `config.toml`, `service.log`)
 - Client SSH snippets: `~/.ssh/rtunnel.d/*.conf`, loaded from `~/.ssh/config` by `rtunnel install`, `rtunnel ssh-config --write`, or `rtunnel ssh-config --all --write`; on Windows the same files live under `%USERPROFILE%\.ssh\rtunnel.d\`
 - Relay agent targets: `agent_targets` table in `rtunnel.db` stores the last targets advertised by each agent, so `rtunnel agents` can describe an agent while it is offline.
 - Relay canonical names: the `peers.display_name` column in `rtunnel.db` stores each device's relay-side name. It is nullable, unique case-insensitively, and preserved across restarts and in-place upgrades.

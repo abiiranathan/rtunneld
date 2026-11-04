@@ -280,6 +280,19 @@ so normal operation is quiet and errors still reach the journal:
 sudo journalctl -u rtunnel.service -f
 ```
 
+On Windows, install and control the service from an elevated PowerShell:
+
+```powershell
+rtunnel.exe --state-dir "$env:APPDATA\rtunnel" service install
+rtunnel.exe service start
+rtunnel.exe service stop
+```
+
+`service install` uses the native Windows Service Control Manager entry point
+(`rtunnel service run`) and updates an existing registration created by older
+releases. Because a Windows service has no console, host output is written to
+`%APPDATA%\rtunnel\service.log`.
+
 A service has no interactive terminal and cannot answer new pairing prompts. To
 add another device, stop the service, pair in the foreground, then start it
 again:

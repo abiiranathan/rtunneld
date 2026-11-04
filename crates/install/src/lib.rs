@@ -444,7 +444,22 @@ pub fn install_service(
     {
         let create_args = sc_create_args(service_name, bin_path, args);
         let create_refs: Vec<&str> = create_args.iter().map(String::as_str).collect();
-        run_sc(&create_refs)?;
+        if run_sc(&create_refs).is_err() {
+            // Upgrading an existing installation: `sc.exe create` fails when the
+            // service is already registered, so update the stored command line
+            // in place instead of leaving an old `binPath` behind.
+            let _ = run_sc(&["stop", service_name]);
+            let bin_path_value = windows_service_bin_path(bin_path, args);
+            let config_args = [
+                "config",
+                service_name,
+                "binPath=",
+                bin_path_value.as_str(),
+                "start=",
+                "auto",
+            ];
+            run_sc(&config_args)?;
+        }
         run_sc(&["start", service_name])?;
         Ok(())
     }
