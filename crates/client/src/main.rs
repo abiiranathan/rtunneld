@@ -14,7 +14,7 @@ use directories::BaseDirs;
 #[cfg(not(windows))]
 use directories::ProjectDirs;
 use futures_util::StreamExt;
-use quinn::Connection;
+use quinn::{Connection, RecvStream, SendStream};
 use rand::Rng;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -32,7 +32,8 @@ use rtunnel_proto::{
     ResultStatus, format_device_id, normalize_device_id,
 };
 use rtunnel_transport::{
-    create_client_endpoint, make_client_config, read_frame, splice_quic_to_stdio, write_frame,
+    create_client_endpoint, make_client_config, read_frame, splice_quic_to_stdio,
+    splice_quic_to_tcp, write_frame,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -40,7 +41,7 @@ use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use tokio::net::lookup_host;
+use tokio::net::{TcpListener, lookup_host};
 use tracing_subscriber::EnvFilter;
 
 #[cfg(windows)]
@@ -244,6 +245,21 @@ enum Command {
         write: bool,
         #[arg(long)]
         all: bool,
+    },
+    /// Forward a local TCP port to a device over the relay.
+    ///
+    /// Keeps a local listener open and, for each accepted connection, opens a
+    /// fresh tunnel session to the device. Useful for `X2Go`, VNC, RDP, or any
+    /// other TCP-based protocol that needs a real listening port.
+    Forward {
+        /// Local address to listen on, e.g. `127.0.0.1:2222`.
+        #[arg(long)]
+        listen: SocketAddr,
+        /// Device ID or canonical name of the target device.
+        target: String,
+        /// Optional destination `host:port` on the device's network. Defaults
+        /// to the device's first allowed target.
+        dest: Option<String>,
     },
 }
 
@@ -1022,31 +1038,140 @@ async fn run_connect(
     }
 
     // Tunnel connect
-    let (mut send, mut recv) = connection.open_bi().await?;
+    let (send, recv) = open_tunnel_stream(&connection, &target, dest.as_deref()).await?;
+    let _ = splice_quic_to_stdio(send, recv, tokio::io::stdin(), tokio::io::stdout()).await;
+    Ok(())
+}
+
+/// Opens a relay session stream to `agent`, negotiating the `ConnectRequest`
+/// handshake and returning the raw bidirectional streams on success.
+///
+/// This is the shared tail of `connect` and `forward`: it opens one QUIC stream,
+/// asks the relay for a session to `agent`, and hands back streams ready to
+/// splice toward stdin/stdout or a local TCP socket.
+///
+/// # Errors
+///
+/// Returns an error if the stream cannot be opened, the destination is
+/// malformed, or the relay rejects the connection.
+async fn open_tunnel_stream(
+    connection: &Connection,
+    agent: &str,
+    dest: Option<&str>,
+) -> Result<(SendStream, RecvStream)> {
     let target_dest = dest
-        .map(|d| HostPort::parse(&d).map_err(|_| anyhow!("invalid target destination")))
+        .map(|d| HostPort::parse(d).map_err(|_| anyhow!("invalid target destination")))
         .transpose()?;
 
+    let (mut send, mut recv) = connection.open_bi().await?;
     let req = ControlMessage::ConnectRequest {
-        agent: target.clone(),
+        agent: agent.to_owned(),
         target: target_dest,
     };
     write_frame(&mut send, &req).await?;
 
-    let resp = read_frame(&mut recv).await?;
-    match resp {
+    match read_frame(&mut recv).await? {
         ControlMessage::ConnectResponse {
             status: ResultStatus::Ok,
             ..
-        } => {
-            let _ = splice_quic_to_stdio(send, recv, tokio::io::stdin(), tokio::io::stdout()).await;
-            Ok(())
-        }
+        } => Ok((send, recv)),
         ControlMessage::ConnectResponse {
             status: ResultStatus::Err(code),
             ..
         } => bail!("connection rejected: {code}"),
         _ => bail!("unexpected response from relay"),
+    }
+}
+
+/// Forwards a local TCP listener to a device over the relay.
+///
+/// Each accepted TCP connection dials the relay and opens its own tunnel
+/// session, so a brief relay or agent outage affects only in-flight connections
+/// and never requires restarting the listener. The loop runs until the process
+/// is interrupted.
+///
+/// # Errors
+///
+/// Returns an error if the client state cannot be loaded, the destination is
+/// malformed, or the listener cannot be bound.
+async fn run_forward(
+    state_dir: &Path,
+    listen: SocketAddr,
+    target: &str,
+    dest: Option<String>,
+) -> Result<()> {
+    let target = normalize_device_id(target);
+    let (config, id) = load_client_state(state_dir)?;
+
+    // Validate the destination once up front so a typo fails fast instead of
+    // being rediscovered on every accepted connection.
+    if let Some(destination) = dest.as_deref()
+        && HostPort::parse(destination).is_err()
+    {
+        bail!("invalid target destination '{destination}'");
+    }
+
+    let verifier = Arc::new(PinnedServerVerifier::new(&config.relay_fingerprint));
+
+    let listener = TcpListener::bind(listen)
+        .await
+        .with_context(|| format!("cannot bind listener on {listen}"))?;
+    let local = listener
+        .local_addr()
+        .context("cannot read listener address")?;
+
+    let label = dest.clone().unwrap_or_else(|| "default target".into());
+    println!(
+        "Forwarding {local} -> {} ({label}); press Ctrl+C to stop",
+        format_device_id(&target)
+    );
+
+    loop {
+        let (tcp, peer) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                eprintln!("rtunnel: listener error: {e}");
+                continue;
+            }
+        };
+        // X2Go, VNC, and RDP are latency-sensitive; disable Nagle's algorithm
+        // on the accepted socket so small interactive frames are not delayed.
+        if let Err(e) = tcp.set_nodelay(true) {
+            eprintln!("rtunnel: cannot enable TCP_NODELAY: {e}");
+        }
+
+        let verifier = Arc::clone(&verifier);
+        let config = config.clone();
+        let id = id.clone();
+        let target = target.clone();
+        let dest = dest.clone();
+
+        tokio::spawn(async move {
+            let connection = match dial_relay(
+                &config.relay_host,
+                config.relay_port,
+                &id,
+                verifier,
+                ALPN_RENDEZVOUS,
+            )
+            .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("rtunnel: cannot reach relay for {peer}: {e:#}");
+                    return;
+                }
+            };
+
+            match open_tunnel_stream(&connection, &target, dest.as_deref()).await {
+                Ok((send, recv)) => {
+                    let _ = splice_quic_to_tcp(send, recv, tcp).await;
+                }
+                Err(e) => {
+                    eprintln!("rtunnel: cannot open tunnel for {peer}: {e:#}");
+                }
+            }
+        });
     }
 }
 
@@ -1968,6 +2093,13 @@ async fn main() -> Result<()> {
                 let agent = agent.context("a device ID or agent name is required")?;
                 print_ssh_config(&state_dir, &agent, target.as_deref()).await?;
             }
+        }
+        Command::Forward {
+            listen,
+            target,
+            dest,
+        } => {
+            run_forward(&state_dir, listen, &target, dest).await?;
         }
     }
     Ok(())
