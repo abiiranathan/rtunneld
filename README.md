@@ -459,6 +459,63 @@ rtunnel tui --remote-term xterm-ghostty
 The list refreshes from the relay every 5 seconds. You need `ssh` on `PATH`; set
 `--user` when your local username differs from the remote one.
 
+### Forwarding a remote GUI or TCP service (`X2Go`, VNC, RDP)
+
+`rtunnel connect` is a stdin/stdout bridge, so it only suits tools that launch
+it as an OpenSSH `ProxyCommand`. Anything that needs a real listening TCP port —
+`X2Go`, VNC, RDP, a web UI — uses `rtunnel forward` instead:
+
+```bash
+rtunnel forward --listen 127.0.0.1:2222 office-pc
+```
+
+This binds `127.0.0.1:2222` and, for each accepted connection, opens a fresh
+tunnel session to `office-pc`'s default target. Point your client at that local
+port and the traffic rides the relay end to end.
+
+To reach a specific target on the device's network, pass it as `host:port`:
+
+```bash
+rtunnel forward --listen 127.0.0.1:5900 office-pc 127.0.0.1:5900    # VNC
+rtunnel forward --listen 127.0.0.1:3389 office-pc 192.168.1.50:3389 # RDP
+```
+
+The target must be in the agent's allowlist, just like SSH. Add it on the host
+before forwarding:
+
+```bash
+sudo rtunnel-agent targets add 127.0.0.1:5900
+sudo systemctl restart rtunnel-agent.service
+```
+
+#### Example: `X2Go` over the relay
+
+Raw X11 forwarding (`ssh -X`) is slow across a WAN because X11 makes many
+synchronous round trips, and the relay is always in the path. `X2Go` (NX) is a
+drop-in desktop replacement that compresses and pipelines those round trips.
+
+1. Install the server on the remote host over the SSH connection you already
+   have (it needs no public IP — that is what rtunnel provides):
+
+   ```bash
+   ssh office-pc 'sudo apt update && sudo apt install -y x2goserver x2goserver-xsession xfce4'
+   # Fedora: sudo dnf install x2goserver x2goserver-xsession @xfce-desktop-environment
+   ```
+
+2. Forward the host's SSH port to a local port:
+
+   ```bash
+   rtunnel forward --listen 127.0.0.1:2222 office-pc
+   ```
+
+3. In the `X2Go` client, create a session with **Host** `127.0.0.1`, **SSH
+   port** `2222`, your remote **Login**, and a **Session type** matching the
+   desktop you installed (for example XFCE). Connect.
+
+The same shape works for VNC (TigerVNC/TurboVNC), RDP (`xrdp` + FreeRDP), or any
+other TCP protocol: install the server on the host, add its port to the
+allowlist, and `rtunnel forward` it to a local port.
+
 ---
 
 ## 8. Relay administration

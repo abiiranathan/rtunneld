@@ -9,7 +9,9 @@ use rtunnel_proto::{
     ResultStatus,
 };
 use rtunnel_relay::{AuditLogger, RelayServer, SqliteStore};
-use rtunnel_transport::{create_client_endpoint, make_client_config, read_frame, write_frame};
+use rtunnel_transport::{
+    create_client_endpoint, make_client_config, read_frame, splice_quic_to_tcp, write_frame,
+};
 use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -17,7 +19,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
@@ -1187,5 +1189,84 @@ async fn test_anydesk_pairing_code_lockout_after_failures() {
     assert!(
         !valid_after_lockout,
         "Pairing code must be locked out after 5 consecutive failures"
+    );
+}
+
+/// Exercises the client-side port-forwarding data path that `rtunnel forward`
+/// relies on: a local TCP listener is bridged to a remote target through a
+/// relay tunnel using [`splice_quic_to_tcp`], and bytes echo back intact.
+#[tokio::test]
+async fn test_forward_local_port_through_tunnel() {
+    let harness = TestHarness::start();
+    let (echo_addr, _echo_handle) = start_echo_server().await;
+
+    let agent_id = harness.enroll_peer("agent-fwd", "agent").await;
+    let client_id = harness.enroll_peer("client-fwd", "client").await;
+    harness.store.add_grant("client-fwd", "agent-fwd").unwrap();
+
+    let agent_cfg = AgentConfig {
+        relay_host: harness.relay_addr.ip().to_string(),
+        relay_port: harness.relay_addr.port(),
+        relay_fingerprint: harness.relay_identity.fingerprint.clone(),
+        agent_name: "agent-fwd".into(),
+        allowed_targets: vec![echo_addr.to_string()],
+        max_sessions: 64,
+    };
+    tokio::spawn(AgentRunner::new(agent_cfg, agent_id).run());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // The local listener mirrors `rtunnel forward --listen 127.0.0.1:0`.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = listener.local_addr().unwrap();
+
+    // A client tunnel connection carries the session, exactly as the forward
+    // command opens one before negotiating `ConnectRequest`.
+    let (_endpoint, connection) = harness
+        .connect_as(&client_id, vec![ALPN_TUNNEL.to_vec()])
+        .await;
+
+    // Accept one local connection and splice it onto a fresh tunnel session.
+    let conn = connection.clone();
+    let server = tokio::spawn(async move {
+        let (tcp, _peer) = listener.accept().await.unwrap();
+        tcp.set_nodelay(true).unwrap();
+
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        write_frame(
+            &mut send,
+            &ControlMessage::ConnectRequest {
+                agent: "agent-fwd".into(),
+                target: Some(HostPort::new(echo_addr.ip().to_string(), echo_addr.port()).unwrap()),
+            },
+        )
+        .await
+        .unwrap();
+        let ControlMessage::ConnectResponse { status, .. } = read_frame(&mut recv).await.unwrap()
+        else {
+            panic!("expected ConnectResponse");
+        };
+        assert_eq!(status, ResultStatus::Ok);
+
+        let _ = splice_quic_to_tcp(send, recv, tcp).await;
+    });
+
+    // Dial the local listener and round-trip a payload through the tunnel.
+    let mut socket = tokio::net::TcpStream::connect(local_addr).await.unwrap();
+    socket.set_nodelay(true).unwrap();
+    let payload = b"forwarded over the tunnel";
+    socket.write_all(payload).await.unwrap();
+
+    let mut echoed = vec![0u8; payload.len()];
+    socket.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(echoed, payload);
+
+    // Closing the socket must propagate a half-close through the splice and end
+    // the server task, confirming no lingering sockets or tasks.
+    drop(socket);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .is_ok(),
+        "forward splice should finish after the local socket closes"
     );
 }
