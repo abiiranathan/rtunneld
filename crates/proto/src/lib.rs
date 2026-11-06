@@ -487,12 +487,21 @@ pub fn format_device_id(raw: &str) -> String {
     }
 }
 
-/// Strips formatting whitespace and dashes from a Device ID string.
+/// Strips formatting from a Device ID string while preserving canonical names.
+///
+/// Device IDs are nine digits and may be typed with spaces or dashes
+/// (`482 913 077` or `482-913-077`). Canonical names match `[a-z0-9-]` and may
+/// legitimately contain hyphens (`office-pc`), so dashes are only removed when
+/// the input is a nine-digit Device ID.
 #[must_use]
 pub fn normalize_device_id(raw: &str) -> String {
-    raw.chars()
-        .filter(|c| !c.is_whitespace() && *c != '-')
-        .collect()
+    let compact: String = raw.chars().filter(|c| !c.is_whitespace()).collect();
+    let digits: String = compact.chars().filter(|c| *c != '-').collect();
+    if digits.len() == 9 && digits.chars().all(|c| c.is_ascii_digit()) {
+        digits
+    } else {
+        compact
+    }
 }
 
 /// Computes a Short Authentication String (SAS, 4 decimal digits) derived from two peer fingerprints.
@@ -524,6 +533,8 @@ mod tests {
         assert_eq!(formatted, "482 913 077");
         assert_eq!(normalize_device_id(&formatted), "482913077");
         assert_eq!(normalize_device_id(" 482-913-077 "), "482913077");
+        // Canonical names may contain hyphens and must be preserved.
+        assert_eq!(normalize_device_id("office-pc"), "office-pc");
     }
 
     #[test]

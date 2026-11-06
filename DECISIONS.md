@@ -8,6 +8,7 @@
 - **Shared Negotiation Tail**: `open_tunnel_stream` was extracted from `run_connect` so `connect` and `forward` share the `ConnectRequest` handshake. `connect` is unchanged in behavior; it now just splices the returned streams to stdio while `forward` splices them to a TCP socket.
 - **Localhost by Default**: `--listen` is a required argument rather than defaulting to a fixed port, so the operator states explicitly which interface and port to expose. Binding is the operator's decision; there is no implicit exposure of a port to the network.
 - **Nagle Disabled**: The accepted socket sets `TCP_NODELAY`, matching the agent's target dial, because X2Go/VNC/RDP traffic is latency-sensitive and dominated by small frames.
+- **Name Resolution Fix**: `normalize_device_id` previously stripped hyphens, which mangled canonical names (`office-pc` → `officepc`) and made `rtunnel connect`/`forward` reject hyphenated names. It now strips dashes only when the input is a nine-digit Device ID, so both the Device ID and canonical names resolve on the client side before the relay's `resolve_agent_reference` sees them.
 
 ## 2026-11-02 — Canonical Device Names and Interactive Picker
 - **Relay-Side Names**: A device's canonical name is a `display_name` column on the relay's `peers` table, not a local-only alias. The relay owns registration and grants, so storing the name there lets `rtunnel agents`, the admin console, `peers-list`, and every workstation agree on the same label without sharing configuration files.

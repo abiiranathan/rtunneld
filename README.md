@@ -466,18 +466,20 @@ it as an OpenSSH `ProxyCommand`. Anything that needs a real listening TCP port �
 `X2Go`, VNC, RDP, a web UI — uses `rtunnel forward` instead:
 
 ```bash
-rtunnel forward --listen 127.0.0.1:2222 office-pc
+rtunnel forward --listen 127.0.0.1:2222 482913077
 ```
 
-This binds `127.0.0.1:2222` and, for each accepted connection, opens a fresh
-tunnel session to `office-pc`'s default target. Point your client at that local
-port and the traffic rides the relay end to end.
+The `--listen` address is the *local* socket bound on your workstation. The
+positional argument is the **Device ID** of the host to reach (a canonical name
+works too). The command opens a fresh tunnel session to that host's default
+target for each accepted connection. Point your client at the local port and the
+traffic rides the relay end to end.
 
-To reach a specific target on the device's network, pass it as `host:port`:
+To reach a specific target on the host's network, pass it as `host:port`:
 
 ```bash
-rtunnel forward --listen 127.0.0.1:5900 office-pc 127.0.0.1:5900    # VNC
-rtunnel forward --listen 127.0.0.1:3389 office-pc 192.168.1.50:3389 # RDP
+rtunnel forward --listen 127.0.0.1:5900 482913077 127.0.0.1:5900    # VNC
+rtunnel forward --listen 127.0.0.1:3389 482913077 192.168.1.50:3389 # RDP
 ```
 
 The target must be in the agent's allowlist, just like SSH. Add it on the host
@@ -502,15 +504,17 @@ drop-in desktop replacement that compresses and pipelines those round trips.
    # Fedora: sudo dnf install x2goserver x2goserver-xsession @xfce-desktop-environment
    ```
 
-2. Forward the host's SSH port to a local port:
+2. Forward the host's SSH port to a local port, using its Device ID (shown by
+   `rtunnel agents`):
 
    ```bash
-   rtunnel forward --listen 127.0.0.1:2222 office-pc
+   rtunnel forward --listen 127.0.0.1:2222 482913077
    ```
 
-3. In the `X2Go` client, create a session with **Host** `127.0.0.1`, **SSH
-   port** `2222`, your remote **Login**, and a **Session type** matching the
-   desktop you installed (for example XFCE). Connect.
+3. In the `X2Go` client, create a session. The **Host** is `127.0.0.1` — the
+   local port `rtunnel forward` is listening on, *not* the remote machine — and
+   the **SSH port** is `2222`. Set your remote **Login** and a **Session type**
+   matching the desktop you installed (for example XFCE). Connect.
 
 The same shape works for VNC (TigerVNC/TurboVNC), RDP (`xrdp` + FreeRDP), or any
 other TCP protocol: install the server on the host, add its port to the
