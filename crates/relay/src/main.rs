@@ -53,7 +53,7 @@ enum Command {
         listen: SocketAddr,
         /// Address for the operator web console. Bind to localhost unless a
         /// TLS-terminating reverse proxy fronts it.
-        #[arg(long, default_value = "127.0.0.1:8080")]
+        #[arg(long, default_value = "127.0.0.1:8090")]
         admin_listen: SocketAddr,
         /// Do not run the operator web console.
         #[arg(long)]
@@ -70,7 +70,7 @@ enum Command {
         listen: SocketAddr,
         /// Address for the operator web console. Bind to localhost unless a
         /// TLS-terminating reverse proxy fronts it.
-        #[arg(long, default_value = "127.0.0.1:8080")]
+        #[arg(long, default_value = "127.0.0.1:8090")]
         admin_listen: SocketAddr,
         /// Do not run the operator web console.
         #[arg(long)]

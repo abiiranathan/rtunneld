@@ -526,7 +526,7 @@ allowlist, and `rtunnel forward` it to a local port.
 
 ### Web console
 
-The relay serves a read-mostly operator console on `127.0.0.1:8080` by default.
+The relay serves a read-mostly operator console on `127.0.0.1:8090` by default.
 It shows connected agents and their advertised targets, peers, grants, active
 enrollment tokens, and recent audit events. From the console you can revoke a
 peer, remove a grant, or revoke an enrollment token. Creating peers, tokens, or
@@ -537,10 +537,10 @@ The console binds to loopback. To use it from your workstation, forward the port
 over SSH:
 
 ```bash
-ssh -L 8080:127.0.0.1:8080 -N root@relay.example.com
+ssh -L 8090:127.0.0.1:8090 -N root@relay.example.com
 ```
 
-Then open <http://127.0.0.1:8080>. Sign in with the admin token, which is
+Then open <http://127.0.0.1:8090>. Sign in with the admin token, which is
 created on first install or start and stored with `0600` permissions:
 
 ```bash

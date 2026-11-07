@@ -28,7 +28,7 @@
 - **Read-Mostly Scope**: The console can inspect peers, grants, tokens, and audit events, and can revoke a peer, remove a grant, or revoke a token. It cannot create peers, tokens, or grants, so enrollment and authorization keep their existing audited CLI and host-pairing paths.
 - **Token Authentication**: A random admin token is created in `admin.token` with `0600` permissions. `RTUNNEL_ADMIN_TOKEN` and `--admin-token` override the file, and the token is never printed or logged.
 - **Session Security**: Browser sessions use random `HttpOnly`, `SameSite=Strict` cookies with a 12-hour lifetime. Mutating actions require a per-session CSRF token, and failed logins are rate-limited per source IP.
-- **Loopback Default**: The console listens on `127.0.0.1:8080` unless `--admin-listen` says otherwise; remote access is through an SSH tunnel or a TLS-terminating reverse proxy. `--no-admin` disables it for installs that do not need it.
+- **Loopback Default**: The console listens on `127.0.0.1:8090` unless `--admin-listen` says otherwise; remote access is through an SSH tunnel or a TLS-terminating reverse proxy. `--no-admin` disables it for installs that do not need it.
 - **Server-Rendered UI**: axum 0.8 serves embedded HTML and CSS with no client-side framework or build step, keeping the relay binary self-contained.
 
 ## 2026-10-27 — Unattended Host Service
